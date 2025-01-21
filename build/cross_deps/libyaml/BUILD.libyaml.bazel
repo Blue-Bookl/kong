@@ -1,5 +1,5 @@
-load("@rules_foreign_cc//foreign_cc:defs.bzl", "configure_make")
 load("@kong_bindings//:variables.bzl", "KONG_VAR")
+load("@rules_foreign_cc//foreign_cc:defs.bzl", "configure_make")
 
 filegroup(
     name = "all_srcs",
@@ -13,15 +13,7 @@ configure_make(
     name = "libyaml",
     configure_command = "configure",
     configure_in_place = True,
-    configure_options = select({
-        "@kong//:arm64-linux-gnu-cross": [
-            "--host=aarch64-linux",
-        ],
-        "@kong//:x86_64-linux-musl-cross": [
-            "--host=x86_64-linux-musl",
-        ],
-        "//conditions:default": [],
-    }),
+    configure_xcompile = True,  # use automatic cross compile detection
     lib_source = ":all_srcs",
     # out_lib_dir = "lib",
     out_shared_libs = select({

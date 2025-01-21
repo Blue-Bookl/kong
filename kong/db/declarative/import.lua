@@ -2,33 +2,82 @@ local lmdb = require("resty.lmdb")
 local txn = require("resty.lmdb.transaction")
 local constants = require("kong.constants")
 local workspaces = require("kong.workspaces")
-local utils = require("kong.tools.utils")
+local cycle_aware_deep_copy = require("kong.tools.table").cycle_aware_deep_copy
 local declarative_config = require("kong.db.schema.others.declarative_config")
+local concurrency = require("kong.concurrency")
 
 
-local cjson_encode = require("cjson.safe").encode
-local deepcopy = require("pl.tablex").deepcopy
+local yield = require("kong.tools.yield").yield
 local marshall = require("kong.db.declarative.marshaller").marshall
 local schema_topological_sort = require("kong.db.schema.topological_sort")
 local nkeys = require("table.nkeys")
+local sha256_hex = require("kong.tools.sha256").sha256_hex
+local pk_string = declarative_config.pk_string
+local EMPTY = require("kong.tools.table").EMPTY
 
 local assert = assert
-local sort = table.sort
 local type = type
 local pairs = pairs
-local next = next
 local insert = table.insert
-local min = math.min
+local string_format = string.format
 local null = ngx.null
-local md5 = ngx.md5
 local get_phase = ngx.get_phase
-local ngx_socket_tcp = ngx.socket.tcp
-local yield = utils.yield
-local sha256 = utils.sha256_hex
+local get_workspace_id = workspaces.get_workspace_id
 
 
 local DECLARATIVE_HASH_KEY = constants.DECLARATIVE_HASH_KEY
 local DECLARATIVE_EMPTY_CONFIG_HASH = constants.DECLARATIVE_EMPTY_CONFIG_HASH
+local DECLARATIVE_DEFAULT_WORKSPACE_KEY = constants.DECLARATIVE_DEFAULT_WORKSPACE_KEY
+
+
+local GLOBAL_WORKSPACE_TAG = "*"
+local UNINIT_WORKSPACE_ID = "00000000-0000-0000-0000-000000000000"
+
+
+local function get_default_workspace()
+  -- in init phase we can not access lmdb
+  if kong.default_workspace == UNINIT_WORKSPACE_ID and
+     get_phase() ~= "init"
+  then
+    local res = kong.db.workspaces:select_by_name("default")
+    kong.default_workspace = assert(res and res.id)
+  end
+
+  return kong.default_workspace
+end
+
+
+-- Generates the appropriate workspace ID for current operating context
+-- depends on schema settings
+--
+-- Non-workspaceable entities are always placed under the "default"
+-- workspace
+--
+-- If the query explicitly set options.workspace == null, then all
+-- workspaces shall be used
+--
+-- If the query explicitly set options.workspace == "some UUID", then
+-- it will be returned
+--
+-- Otherwise, the current workspace ID will be returned
+local function workspace_id(schema, options)
+  if not schema.workspaceable then
+    return get_default_workspace()
+  end
+
+  -- options.workspace does not exist
+  if not options or not options.workspace or options.workspace == "" then
+    return get_workspace_id()
+  end
+
+  -- global query, like routes:each(page_size, GLOBAL_QUERY_OPTS)
+  if options.workspace == null then
+    return GLOBAL_WORKSPACE_TAG
+  end
+
+  -- options.workspace is a UUID
+  return options.workspace
+end
 
 
 local function find_or_create_current_workspace(name)
@@ -91,7 +140,7 @@ local function load_into_db(entities, meta)
 
     local primary_key, ok, err, err_t
     for _, entity in pairs(entities[schema_name]) do
-      entity = deepcopy(entity)
+      entity = cycle_aware_deep_copy(entity)
       entity._tags = nil
       entity.ws_id = nil
 
@@ -108,16 +157,76 @@ local function load_into_db(entities, meta)
 end
 
 
+--- Remove all nulls from declarative config.
+-- Declarative config is a huge table. Use iteration
+-- instead of recursion to improve performance.
 local function remove_nulls(tbl)
-  for k,v in pairs(tbl) do
-    if v == null then
-      tbl[k] = nil
+  local stk = { tbl }
+  local n = #stk
 
-    elseif type(v) == "table" then
-      tbl[k] = remove_nulls(v)
+  local cur
+  while n > 0 do
+    cur = stk[n]
+
+    stk[n] = nil
+    n = n - 1
+
+    if type(cur) == "table" then
+      for k, v in pairs(cur) do
+        if v == null then
+          cur[k] = nil
+
+        elseif type(v) == "table" then
+          n = n + 1
+          stk[n] = v
+        end
+      end
     end
   end
+
   return tbl
+end
+
+
+--- Restore all nulls for declarative config.
+-- Declarative config is a huge table. Use iteration
+-- instead of recursion to improve performance.
+local function restore_nulls(original_tbl, transformed_tbl)
+  local o_stk = { original_tbl }
+  local o_n = #o_stk
+
+  local t_stk = { transformed_tbl }
+  local t_n = #t_stk
+
+  local o_cur, t_cur
+  while o_n > 0 and o_n == t_n do
+    o_cur = o_stk[o_n]
+    o_stk[o_n] = nil
+    o_n = o_n - 1
+
+    t_cur = t_stk[t_n]
+    t_stk[t_n] = nil
+    t_n = t_n - 1
+
+    for k, v in pairs(o_cur) do
+      if v == null and
+         t_cur[k] == nil
+      then
+        t_cur[k] = null
+
+      elseif type(v) == "table" and
+             type(t_cur[k]) == "table"
+      then
+        o_n = o_n + 1
+        o_stk[o_n] = v
+
+        t_n = t_n + 1
+        t_stk[t_n] = t_cur[k]
+      end
+    end
+  end
+
+  return transformed_tbl
 end
 
 
@@ -126,31 +235,184 @@ local function get_current_hash()
 end
 
 
-local function find_default_ws(entities)
-  for _, v in pairs(entities.workspaces or {}) do
-    if v.name == "default" then
+local function find_ws(entities, name)
+  for _, v in pairs(entities.workspaces or EMPTY) do
+    if v.name == name then
       return v.id
     end
   end
 end
 
 
-local function unique_field_key(schema_name, ws_id, field, value, unique_across_ws)
-  if unique_across_ws then
-    ws_id = ""
+-- unique key
+local function unique_field_key(schema_name, ws_id, field, value)
+  return string_format("U|%s|%s|%s|%s", schema_name, field, ws_id, sha256_hex(value))
+end
+
+
+-- foreign key
+local function foreign_field_key_prefix(schema_name, ws_id, field, foreign_id)
+  if ws_id == GLOBAL_WORKSPACE_TAG then
+    return string_format("F|%s|%s|%s|", schema_name, field, foreign_id)
   end
 
-  -- LMDB imposes a default limit of 511 for keys, but the length of our unique
-  -- value might be unbounded, so we'll use a checksum instead of the raw value
-  value = sha256(value)
+  return string_format("F|%s|%s|%s|%s|", schema_name, field, foreign_id, ws_id)
+end
 
-  return schema_name .. "|" .. ws_id .. "|" .. field .. ":" .. value
+
+local function foreign_field_key(schema_name, ws_id, field, foreign_id, pk)
+  assert(ws_id ~= GLOBAL_WORKSPACE_TAG)
+  return foreign_field_key_prefix(schema_name, ws_id, field, foreign_id) .. pk
+end
+
+-- item key
+local function item_key_prefix(schema_name, ws_id)
+  if ws_id == GLOBAL_WORKSPACE_TAG then
+    return string_format("I|%s|", schema_name)
+  end
+
+  return string_format("I|%s|%s|", schema_name, ws_id)
+end
+
+
+local function item_key(schema_name, ws_id, pk_str)
+  assert(ws_id ~= GLOBAL_WORKSPACE_TAG)
+  return item_key_prefix(schema_name, ws_id) .. pk_str
 end
 
 
 local function config_is_empty(entities)
   -- empty configuration has no entries other than workspaces
   return entities.workspaces and nkeys(entities) == 1
+end
+
+
+-- common implementation for
+-- insert_entity_for_txn() and delete_entity_for_txn()
+local function _set_entity_for_txn(t, entity_name, item, options, is_delete)
+  local dao = kong.db[entity_name]
+  local schema = dao.schema
+  local pk = pk_string(schema, item)
+
+  -- If the item belongs to a specific workspace,
+  -- use it directly without using the default one.
+  local ws_id = item.ws_id or workspace_id(schema, options)
+
+  local itm_key = item_key(entity_name, ws_id, pk)
+
+  -- if we are deleting, item_value and idx_value should be nil
+  local itm_value, idx_value
+
+  -- if we are inserting or updating
+  -- itm_value is serialized entity
+  -- idx_value is the lmdb item_key
+  if not is_delete then
+    local err
+
+    -- serialize item with possible nulls
+    itm_value, err = marshall(item)
+    if not itm_value then
+      return nil, err
+    end
+
+    idx_value = itm_key
+  end
+
+  -- store serialized entity into lmdb
+  t:set(itm_key, itm_value)
+
+  -- select_by_cache_key
+  if schema.cache_key then
+    local cache_key = dao:cache_key(item)
+    -- The second parameter (ws_id) is a placeholder here, because the cache_key
+    -- is already unique globally.
+    local key = unique_field_key(entity_name, get_default_workspace(),
+                                 "cache_key", cache_key)
+    -- store item_key or nil into lmdb
+    t:set(key, idx_value)
+  end
+
+  for fname, fdata in schema:each_field() do
+    local is_foreign = fdata.type == "foreign"
+    local fdata_reference = fdata.reference
+    local value = item[fname]
+    -- avoid overriding the outer ws_id
+    local field_ws_id = fdata.unique_across_ws and kong.default_workspace or ws_id
+
+    -- value may be null, we should skip it
+    if not value or value == null then
+      goto continue
+    end
+
+    -- value should be a string or table
+
+    local value_str
+
+    if fdata.unique then
+      -- unique and not a foreign key, or is a foreign key, but non-composite
+      -- see: validate_foreign_key_is_single_primary_key, composite foreign
+      -- key is currently unsupported by the DAO
+      if type(value) == "table" then
+        assert(is_foreign)
+        value_str = pk_string(kong.db[fdata_reference].schema, value)
+      end
+
+      local key = unique_field_key(entity_name, field_ws_id, fname, value_str or value)
+      -- store item_key or nil into lmdb
+      t:set(key, idx_value)
+    end
+
+    if is_foreign then
+      -- is foreign, generate page_for_foreign_field indexes
+      assert(type(value) == "table")
+
+      value_str = pk_string(kong.db[fdata_reference].schema, value)
+
+      local key = foreign_field_key(entity_name, field_ws_id, fname, value_str, pk)
+      -- store item_key or nil into lmdb
+      t:set(key, idx_value)
+    end
+
+    ::continue::
+  end -- for fname, fdata in schema:each_field()
+
+  return true
+end
+
+
+-- Serialize and set keys for a single validated entity into
+-- the provided LMDB txn object, this operation is only safe
+-- is the entity does not already exist inside the LMDB database
+--
+-- The actual item key is: I|<entity_name>|<ws_id>|<pk_string>
+--
+-- This function sets the following key-value pairs:
+--
+-- key:   I|<entity_name>|<ws_id>|<pk_string>
+-- value: serialized item
+--
+-- key:   U|<entity_name>|<unique_field_name>|<ws_id>|sha256(field_value)
+-- value: actual item key
+--
+-- key:   F|<entity_name>|<foreign_field_name>|<foreign_key>|<ws_id>|<pk_string>
+-- value: actual item key
+--
+-- The format of the key string follows the sequence of the construction order:
+-- `item type > entity name > specific item info > workspace id > item uuid`
+-- This order makes it easier to query all entities using API lmdb_prefix.page().
+--
+-- DO NOT touch `item`, or else the entity will be changed
+local function insert_entity_for_txn(t, entity_name, item, options)
+  return _set_entity_for_txn(t, entity_name, item, options, false)
+end
+
+
+-- Serialize and remove keys for a single validated entity into
+-- the provided LMDB txn object, this operation is safe whether the provided
+-- entity exists inside LMDB or not, but the provided entity must contains the
+-- correct field value so indexes can be deleted correctly
+local function delete_entity_for_txn(t, entity_name, item, options)
+  return _set_entity_for_txn(t, entity_name, item, options, true)
 end
 
 
@@ -168,37 +430,27 @@ end
 --     _transform: true,
 --   }
 local function load_into_cache(entities, meta, hash)
-  -- Array of strings with this format:
-  -- "<tag_name>|<entity_name>|<uuid>".
-  -- For example, a service tagged "admin" would produce
-  -- "admin|services|<the service uuid>"
-  local tags = {}
-  meta = meta or {}
+  local default_workspace_id = assert(find_ws(entities, "default"))
+  local should_transform = meta._transform == nil and true or meta._transform
 
-  local default_workspace = assert(find_default_ws(entities))
-  local fallback_workspace = default_workspace
+  assert(type(default_workspace_id) == "string")
 
-  assert(type(fallback_workspace) == "string")
+  -- set it for insert_entity_for_txn()
+  kong.default_workspace = default_workspace_id
 
   if not hash or hash == "" or config_is_empty(entities) then
     hash = DECLARATIVE_EMPTY_CONFIG_HASH
   end
 
-  -- Keys: tag name, like "admin"
-  -- Values: array of encoded tags, similar to the `tags` variable,
-  -- but filtered for a given tag
-  local tags_by_name = {}
-
   local db = kong.db
 
-  local t = txn.begin(128)
+  local t = txn.begin(512)
   t:db_drop(false)
 
   local phase = get_phase()
-  local transform = meta._transform == nil and true or meta._transform
 
   for entity_name, items in pairs(entities) do
-    yield(false, phase)
+    yield(true, phase)
 
     local dao = db[entity_name]
     if not dao then
@@ -206,227 +458,39 @@ local function load_into_cache(entities, meta, hash)
     end
     local schema = dao.schema
 
-    -- Keys: tag_name, eg "admin"
-    -- Values: dictionary of keys associated to this tag,
-    --         for a specific entity type
-    --         i.e. "all the services associated to the 'admin' tag"
-    --         The ids are keys, and the values are `true`
-    local taggings = {}
-
-    local uniques = {}
-    local page_for = {}
-    local foreign_fields = {}
-    for fname, fdata in schema:each_field() do
-      local is_foreign = fdata.type == "foreign"
-      local fdata_reference = fdata.reference
-
-      if fdata.unique then
-        if is_foreign then
-          if #db[fdata_reference].schema.primary_key == 1 then
-            insert(uniques, fname)
-          end
-
-        else
-          insert(uniques, fname)
-        end
-      end
-      if is_foreign then
-        page_for[fdata_reference] = {}
-        foreign_fields[fname] = fdata_reference
-      end
-    end
-
-    local keys_by_ws = {
-      -- map of keys for global queries
-      ["*"] = {}
-    }
-    for id, item in pairs(items) do
-      -- When loading the entities, when we load the default_ws, we
-      -- set it to the current. But this only works in the worker that
-      -- is doing the loading (0), other ones still won't have it
-
-      yield(true, phase)
-
-      assert(type(fallback_workspace) == "string")
-
-      local ws_id = ""
-      if schema.workspaceable then
-        local item_ws_id = item.ws_id
-        if item_ws_id == null or item_ws_id == nil then
-          item_ws_id = fallback_workspace
-        end
-        item.ws_id = item_ws_id
-        ws_id = item_ws_id
+    for _, item in pairs(items) do
+      if not schema.workspaceable or item.ws_id == null or item.ws_id == nil then
+        item.ws_id = default_workspace_id
       end
 
-      assert(type(ws_id) == "string")
+      assert(type(item.ws_id) == "string")
 
-      local cache_key = dao:cache_key(id, nil, nil, nil, nil, item.ws_id)
+      if should_transform and schema:has_transformations(item) then
+        local transformed_item = cycle_aware_deep_copy(item)
+        remove_nulls(transformed_item)
 
-      item = remove_nulls(item)
-      if transform then
         local err
-        item, err = schema:transform(item)
+        transformed_item, err = schema:transform(transformed_item)
+        if not transformed_item then
+          return nil, err
+        end
+
+        item = restore_nulls(item, transformed_item)
         if not item then
           return nil, err
         end
       end
 
-      local item_marshalled, err = marshall(item)
-      if not item_marshalled then
+      -- nil means no extra options
+      local res, err = insert_entity_for_txn(t, entity_name, item, nil)
+      if not res then
         return nil, err
       end
+    end -- for for _, item
+  end -- for entity_name, items
 
-      t:set(cache_key, item_marshalled)
-
-      local global_query_cache_key = dao:cache_key(id, nil, nil, nil, nil, "*")
-      t:set(global_query_cache_key, item_marshalled)
-
-      -- insert individual entry for global query
-      insert(keys_by_ws["*"], cache_key)
-
-      -- insert individual entry for workspaced query
-      if ws_id ~= "" then
-        keys_by_ws[ws_id] = keys_by_ws[ws_id] or {}
-        local keys = keys_by_ws[ws_id]
-        insert(keys, cache_key)
-      end
-
-      if schema.cache_key then
-        local cache_key = dao:cache_key(item)
-        t:set(cache_key, item_marshalled)
-      end
-
-      for i = 1, #uniques do
-        local unique = uniques[i]
-        local unique_key = item[unique]
-        if unique_key then
-          if type(unique_key) == "table" then
-            local _
-            -- this assumes that foreign keys are not composite
-            _, unique_key = next(unique_key)
-          end
-
-          local key = unique_field_key(entity_name, ws_id, unique, unique_key,
-                                       schema.fields[unique].unique_across_ws)
-
-          t:set(key, item_marshalled)
-        end
-      end
-
-      for fname, ref in pairs(foreign_fields) do
-        local item_fname = item[fname]
-        if item_fname then
-          local fschema = db[ref].schema
-
-          local fid = declarative_config.pk_string(fschema, item_fname)
-
-          -- insert paged search entry for global query
-          page_for[ref]["*"] = page_for[ref]["*"] or {}
-          page_for[ref]["*"][fid] = page_for[ref]["*"][fid] or {}
-          insert(page_for[ref]["*"][fid], cache_key)
-
-          -- insert paged search entry for workspaced query
-          page_for[ref][ws_id] = page_for[ref][ws_id] or {}
-          page_for[ref][ws_id][fid] = page_for[ref][ws_id][fid] or {}
-          insert(page_for[ref][ws_id][fid], cache_key)
-        end
-      end
-
-      local item_tags = item.tags
-      if item_tags then
-        local ws = schema.workspaceable and ws_id or ""
-        for i = 1, #item_tags do
-          local tag_name = item_tags[i]
-          insert(tags, tag_name .. "|" .. entity_name .. "|" .. id)
-
-          tags_by_name[tag_name] = tags_by_name[tag_name] or {}
-          insert(tags_by_name[tag_name], tag_name .. "|" .. entity_name .. "|" .. id)
-
-          taggings[tag_name] = taggings[tag_name] or {}
-          taggings[tag_name][ws] = taggings[tag_name][ws] or {}
-          taggings[tag_name][ws][cache_key] = true
-        end
-      end
-    end
-
-    for ws_id, keys in pairs(keys_by_ws) do
-      local entity_prefix = entity_name .. "|" .. (schema.workspaceable and ws_id or "")
-
-      local keys, err = marshall(keys)
-      if not keys then
-        return nil, err
-      end
-
-      t:set(entity_prefix .. "|@list", keys)
-
-      for ref, wss in pairs(page_for) do
-        local fids = wss[ws_id]
-        if fids then
-          for fid, entries in pairs(fids) do
-            local key = entity_prefix .. "|" .. ref .. "|" .. fid .. "|@list"
-
-            local entries, err = marshall(entries)
-            if not entries then
-              return nil, err
-            end
-
-            t:set(key, entries)
-          end
-        end
-      end
-    end
-
-    -- taggings:admin|services|ws_id|@list -> uuids of services tagged "admin" on workspace ws_id
-    for tag_name, workspaces_dict in pairs(taggings) do
-      for ws_id, keys_dict in pairs(workspaces_dict) do
-        local key = "taggings:" .. tag_name .. "|" .. entity_name .. "|" .. ws_id .. "|@list"
-
-        -- transform the dict into a sorted array
-        local arr = {}
-        local len = 0
-        for id in pairs(keys_dict) do
-          len = len + 1
-          arr[len] = id
-        end
-        -- stay consistent with pagination
-        sort(arr)
-
-        local arr, err = marshall(arr)
-        if not arr then
-          return nil, err
-        end
-
-        t:set(key, arr)
-      end
-    end
-  end
-
-  for tag_name, tags in pairs(tags_by_name) do
-    yield(true, phase)
-
-    -- tags:admin|@list -> all tags tagged "admin", regardless of the entity type
-    -- each tag is encoded as a string with the format "admin|services|uuid", where uuid is the service uuid
-    local key = "tags:" .. tag_name .. "|@list"
-    local tags, err = marshall(tags)
-    if not tags then
-      return nil, err
-    end
-
-    t:set(key, tags)
-  end
-
-  -- tags||@list -> all tags, with no distinction of tag name or entity type.
-  -- each tag is encoded as a string with the format "admin|services|uuid", where uuid is the service uuid
-  local tags, err = marshall(tags)
-  if not tags then
-    return nil, err
-  end
-
-  t:set("tags||@list", tags)
   t:set(DECLARATIVE_HASH_KEY, hash)
-
-  kong.default_workspace = default_workspace
+  t:set(DECLARATIVE_DEFAULT_WORKSPACE_KEY, default_workspace_id)
 
   local ok, err = t:commit()
   if not ok then
@@ -436,16 +500,16 @@ local function load_into_cache(entities, meta, hash)
   kong.core_cache:purge()
   kong.cache:purge()
 
-  yield(false, phase)
-
-  return true, nil, default_workspace
+  return true, nil, default_workspace_id
 end
 
 
 local load_into_cache_with_events
 do
-  local IS_HTTP_SUBSYSTEM = ngx.config.subsystem == "http"
-  local STREAM_CONFIG_SOCK = "unix:" .. ngx.config.prefix() .. "/stream_config.sock"
+  local events = require("kong.runloop.events")
+
+  local md5 = ngx.md5
+  local min = math.min
 
   local exiting = ngx.worker.exiting
 
@@ -454,80 +518,50 @@ do
       return nil, "exiting"
     end
 
-    local reconfigure_data
-    local worker_events = kong.worker_events
-
     local ok, err, default_ws = load_into_cache(entities, meta, hash)
-    if ok then
-      local router_hash
-      local plugins_hash
-      local balancer_hash
-      if hashes then
-        if hashes.routes ~= DECLARATIVE_EMPTY_CONFIG_HASH then
-          router_hash = md5(hashes.services .. hashes.routes)
-        else
-          router_hash = DECLARATIVE_EMPTY_CONFIG_HASH
-        end
-
-        plugins_hash = hashes.plugins
-
-        local upstreams_hash = hashes.upstreams
-        local targets_hash   = hashes.targets
-        if upstreams_hash ~= DECLARATIVE_EMPTY_CONFIG_HASH or
-           targets_hash   ~= DECLARATIVE_EMPTY_CONFIG_HASH
-        then
-          balancer_hash = md5(upstreams_hash .. targets_hash)
-
-        else
-          balancer_hash = DECLARATIVE_EMPTY_CONFIG_HASH
-        end
+    if not ok then
+      if err:find("MDB_MAP_FULL", nil, true) then
+        return nil, "map full"
       end
 
-      reconfigure_data = {
-        default_ws,
-        router_hash,
-        plugins_hash,
-        balancer_hash,
-      }
-
-      ok, err = worker_events.post("declarative", "reconfigure", reconfigure_data)
-      if ok ~= "done" then
-        return nil, "failed to broadcast reconfigure event: " .. (err or ok)
-      end
-
-    elseif err:find("MDB_MAP_FULL", nil, true) then
-      return nil, "map full"
-
-    else
       return nil, err
     end
 
-    if IS_HTTP_SUBSYSTEM and #kong.configuration.stream_listeners > 0 then
-      -- update stream if necessary
+    local router_hash
+    local plugins_hash
+    local balancer_hash
 
-      local json, err = cjson_encode(reconfigure_data)
-      if not json then
-        return nil, err
+    if hashes then
+      if hashes.routes ~= DECLARATIVE_EMPTY_CONFIG_HASH then
+        router_hash = md5(hashes.services .. hashes.routes)
+      else
+        router_hash = DECLARATIVE_EMPTY_CONFIG_HASH
       end
 
-      local sock = ngx_socket_tcp()
-      ok, err = sock:connect(STREAM_CONFIG_SOCK)
-      if not ok then
-        return nil, err
+      plugins_hash = hashes.plugins
+
+      local upstreams_hash = hashes.upstreams
+      local targets_hash   = hashes.targets
+      if upstreams_hash ~= DECLARATIVE_EMPTY_CONFIG_HASH or
+         targets_hash   ~= DECLARATIVE_EMPTY_CONFIG_HASH
+      then
+        balancer_hash = md5(upstreams_hash .. targets_hash)
+      else
+        balancer_hash = DECLARATIVE_EMPTY_CONFIG_HASH
       end
-
-      local bytes
-      bytes, err = sock:send(json)
-      sock:close()
-
-      if not bytes then
-        return nil, err
-      end
-
-      assert(bytes == #json,
-             "incomplete reconfigure data sent to the stream subsystem")
     end
 
+    local reconfigure_data = {
+      default_ws,
+      router_hash,
+      plugins_hash,
+      balancer_hash,
+    }
+
+    ok, err = events.declarative_reconfigure_notify(reconfigure_data)
+    if not ok then
+      return nil, err
+    end
 
     if exiting() then
       return nil, "exiting"
@@ -544,23 +578,24 @@ do
   local DECLARATIVE_RETRY_TTL_MAX = 10
   local DECLARATIVE_LOCK_KEY = "declarative:lock"
 
-  -- make sure no matter which path it exits, we released the lock.
   load_into_cache_with_events = function(entities, meta, hash, hashes)
-    local kong_shm = ngx.shared.kong
+    local ok, err, ttl = concurrency.with_worker_mutex({
+      name = DECLARATIVE_LOCK_KEY,
+      timeout = 0,
+      exptime = DECLARATIVE_LOCK_TTL,
+    }, function()
+      return load_into_cache_with_events_no_lock(entities, meta, hash, hashes)
+    end)
 
-    local ok, err = kong_shm:add(DECLARATIVE_LOCK_KEY, 0, DECLARATIVE_LOCK_TTL)
     if not ok then
-      if err == "exists" then
-        local ttl = min(kong_shm:ttl(DECLARATIVE_LOCK_KEY), DECLARATIVE_RETRY_TTL_MAX)
-        return nil, "busy", ttl
+      if err == "timeout" then
+        ttl = ttl or DECLARATIVE_RETRY_TTL_MAX
+        local retry_after = min(ttl, DECLARATIVE_RETRY_TTL_MAX)
+        return nil, "busy", retry_after
       end
 
-      kong_shm:delete(DECLARATIVE_LOCK_KEY)
       return nil, err
     end
-
-    ok, err = load_into_cache_with_events_no_lock(entities, meta, hash, hashes)
-    kong_shm:delete(DECLARATIVE_LOCK_KEY)
 
     return ok, err
   end
@@ -570,8 +605,17 @@ end
 return {
   get_current_hash = get_current_hash,
   unique_field_key = unique_field_key,
+  foreign_field_key = foreign_field_key,
+  foreign_field_key_prefix = foreign_field_key_prefix,
+  item_key = item_key,
+  item_key_prefix = item_key_prefix,
+  workspace_id = workspace_id,
 
   load_into_db = load_into_db,
   load_into_cache = load_into_cache,
   load_into_cache_with_events = load_into_cache_with_events,
+  insert_entity_for_txn = insert_entity_for_txn,
+  delete_entity_for_txn = delete_entity_for_txn,
+
+  GLOBAL_WORKSPACE_TAG = GLOBAL_WORKSPACE_TAG,
 }

@@ -2,19 +2,20 @@ name: Performance Test
 
 on:
   pull_request:
-  issue_comment:
-    types: [created]
   schedule:
   # don't know the timezone but it's daily at least
   - cron:  '0 7 * * *'
 
 env:
   terraform_version: '1.2.4'
-  DOWNLOAD_ROOT: $HOME/download-root
+  HAS_ACCESS_TO_GITHUB_TOKEN: ${{ github.event_name != 'pull_request' || (github.event.pull_request.head.repo.full_name == github.repository && github.actor != 'dependabot[bot]') }}
+  BUILD_ROOT: ${{ github.workspace }}/bazel-bin/build
 
+  # only for pr
+  GHA_CACHE: ${{ github.event_name == 'pull_request' }}
 
 jobs:
-  build:
+  build-packages:
     name: Build dependencies
     runs-on: ubuntu-22.04
     if: |
@@ -26,70 +27,66 @@ jobs:
         (startsWith(github.event.comment.body, '/perf') || startsWith(github.event.comment.body, '/flamegraph'))
       )
 
-    env:
-      DOWNLOAD_ROOT: $HOME/download-root
+    outputs:
+      cache-key: ${{ steps.cache-key.outputs.cache-key }}
 
     steps:
-    - name: Set environment variables
-      run: |
-          echo "INSTALL_ROOT=$HOME/install-root" >> $GITHUB_ENV
-          echo "DOWNLOAD_ROOT=$HOME/download-root" >> $GITHUB_ENV
-          echo "LD_LIBRARY_PATH=$INSTALL_ROOT/openssl/lib:$LD_LIBRARY_PATH" >> $GITHUB_ENV
-
     - name: Checkout Kong source code
-      uses: actions/checkout@v3
+      uses: actions/checkout@v4
+
+    - name: Generate cache key
+      id: cache-key
+      uses: ./.github/actions/build-cache-key
+      with:
+        prefix: perf
 
     - name: Lookup build cache
       id: cache-deps
-      uses: actions/cache@v3
+      uses: actions/cache@v4
       with:
-        path: ${{ env.INSTALL_ROOT }}
-        key: ${{ hashFiles('.requirements', 'kong-*.rockspec', '.bazelversion', '**/*.bzl', '**/*.bazel', '.github/workflows/perf.yml') }}
+        path: ${{ env.BUILD_ROOT }}
+        key: ${{ steps.cache-key.outputs.cache-key }}
 
     - name: Install packages
       if: steps.cache-deps.outputs.cache-hit != 'true'
       run: sudo apt update && sudo apt install libyaml-dev valgrind libprotobuf-dev
 
-    - name: Build OpenResty
+    - name: Build Kong
       if: steps.cache-deps.outputs.cache-hit != 'true'
       env:
-        GITHUB_TOKEN: ${{ secrets.GHA_KONG_BOT_READ_TOKEN }}
+        GH_TOKEN: ${{ github.token }}
       run: |
-        bazel build //build/openresty:openresty --action_env=DOWNLOAD_ROOT=$DOWNLOAD_ROOT --action_env=INSTALL_ROOT=$INSTALL_ROOT
+        make build-kong
+        BUILD_PREFIX=$BUILD_ROOT/kong-dev
+        export PATH="$BUILD_PREFIX/bin:$BUILD_PREFIX/openresty/nginx/sbin:$BUILD_PREFIX/openresty/bin:$PATH"
+        chmod +rw -R $BUILD_PREFIX
         nginx -V
+        ldd $(which nginx)
+        luarocks
 
     - name: Bazel Outputs
-      uses: actions/upload-artifact@v3
+      uses: actions/upload-artifact@v4
       if: failure()
       with:
         name: bazel-outputs
         path: |
-          bazel-bin/
-          bazel-out/
+          bazel-out/_tmp/actions
+        retention-days: 3
 
-    - name: Checkout go-pluginserver
-      if: steps.cache-deps.outputs.cache-hit != 'true'
-      uses: actions/checkout@v3
-      with:
-        repository: Kong/go-pluginserver
-        path: go-pluginserver
-
-    - name: Add to Path
-      if: steps.cache-deps.outputs.cache-hit != 'true'
-      run: echo "$INSTALL_ROOT/openssl/bin:$INSTALL_ROOT/openresty/nginx/sbin:$INSTALL_ROOT/openresty/bin:$INSTALL_ROOT/luarocks/bin:$GITHUB_WORKSPACE/kong-build-tools/openresty-build-tools" >> $GITHUB_PATH
-
-    - name: Build Kong dependencies
+    - name: Build Dev Kong dependencies
       if: steps.cache-deps.outputs.cache-hit != 'true'
       run: |
-          eval `luarocks path`
-          make dev
-
-  # the above should be same as build_and_test.yml expect that perf.yml is used in cache_key
+        make install-dev-rocks
 
   perf:
     name: RPS, latency and flamegraphs
     runs-on: ubuntu-22.04
-    needs: build
+    needs: build-packages
+
+    permissions:
+      # required to send comment of graphs and results in the PR
+      pull-requests: write
+
     if: |
       github.event_name == 'schedule' ||
       (github.event_name == 'pull_request' && startsWith(github.event.pull_request.title, 'perf(')) ||
@@ -112,27 +109,19 @@ jobs:
         branch: "gh-mutex"
         repo-token: ${{ secrets.PAT }}
 
-    - name: Set environment variables
-      run: |
-          echo "INSTALL_ROOT=$HOME/install-root" >> $GITHUB_ENV
-          echo "DOWNLOAD_ROOT=$HOME/download-root" >> $GITHUB_ENV
-          echo "LD_LIBRARY_PATH=$INSTALL_ROOT/openssl/lib:$LD_LIBRARY_PATH" >> $GITHUB_ENV
-
     - name: Checkout Kong source code
-      uses: actions/checkout@v3
+      uses: actions/checkout@v4
       with:
         # Fetch all history for all tags and branches
         fetch-depth: 0
 
-    - name: Lookup build cache
-      uses: actions/cache@v3
+    - name: Load Cached Packages
       id: cache-deps
+      if: env.GHA_CACHE == 'true'
+      uses: actions/cache@v4
       with:
-        path: ${{ env.INSTALL_ROOT }}
-        key: ${{ hashFiles('.requirements', 'kong-*.rockspec', '.bazelversion', '**/*.bzl', '**/*.bazel', '.github/workflows/perf.yml') }}
-
-    - name: Add to Path
-      run: echo "$INSTALL_ROOT/openssl/bin:$INSTALL_ROOT/openresty/nginx/sbin:$INSTALL_ROOT/openresty/bin:$INSTALL_ROOT/luarocks/bin:$GITHUB_WORKSPACE/kong-build-tools/openresty-build-tools:$INSTALL_ROOT/go-pluginserver" >> $GITHUB_PATH
+        path: ${{ env.BUILD_ROOT }}
+        key: ${{ needs.build-packages.outputs.cache-key }}
 
     - name: Install performance test Dependencies
       run: |
@@ -147,8 +136,8 @@ jobs:
     - name: Choose perf suites
       id: choose_perf
       run: |
-        suites=$(echo "${{ github.event.comment.body }}" | awk '{print $1}')
-        tags=$(echo "${{ github.event.comment.body }}" | awk '{print $2}')
+        suites="$(printf '%s' "${{ github.event.comment.body }}" | awk '{print $1}')"
+        tags="$(printf '%s' "${{ github.event.comment.body }}" | awk '{print $2}')"
 
         if [[ $suite == "/flamegraph" ]]; then
           suites="02-flamegraph"
@@ -171,7 +160,7 @@ jobs:
         echo "suites=$suites" >> $GITHUB_OUTPUT
         echo "tags=$tags" >> $GITHUB_OUTPUT
 
-    - uses: xt0rted/pull-request-comment-branch@653a7d5ca8bd91d3c5cb83286063314d0b063b8e # v1.4.1
+    - uses: xt0rted/pull-request-comment-branch@d97294d304604fa98a2600a6e2f916a84b596dc7 # v1.4.1
       id: comment-branch
       if: github.event_name == 'issue_comment' && github.event.action == 'created'
 
@@ -179,7 +168,7 @@ jobs:
       id: compare_versions
       run: |
         pr_ref=$(echo "${{ github.event.pull_request.base.ref }}")
-        custom_vers=$(echo "${{ github.event.comment.body }}" | awk '{print $3}')
+        custom_vers="$(printf '%s' "${{ github.event.comment.body }}" | awk '{print $3}')"
 
         if [[ ! -z "${pr_ref}" ]]; then
           vers="git:${{ github.head_ref }},git:${pr_ref}"
@@ -223,12 +212,13 @@ jobs:
         sudo iptables -t nat -I OUTPUT -p tcp --dport 5432  -d ${PERF_TEST_BYO_KONG_IP} -j DNAT --to 127.0.0.1:15432
         sudo iptables -t nat -I OUTPUT -p tcp --dport 39001 -d ${PERF_TEST_BYO_KONG_IP} -j DNAT --to 127.0.0.1:39001
 
-        eval `luarocks path`
+        make dev # required to install other dependencies like bin/grpcurl
+        source ${{ env.BUILD_ROOT }}/kong-dev-venv.sh
         for suite in ${{ steps.choose_perf.outputs.suites }}; do
           # Run each test individually, ngx.pipe doesn't like to be imported twice
           # maybe bin/busted --no-auto-insulate
           for f in $(find "spec/04-perf/$suite/" -type f); do
-            bin/busted -o gtest "$f" \
+            bin/busted "$f" \
               -t "${{ steps.choose_perf.outputs.tags }}"
           done
         done
@@ -248,8 +238,9 @@ jobs:
         export PERF_TEST_BYO_SSH_KEY_PATH=$(pwd)/ssh_key
         echo "${{ secrets.PERF_TEST_BYO_SSH_KEY }}" > ${PERF_TEST_BYO_SSH_KEY_PATH}
 
-        eval `luarocks path`
-        bin/busted -o gtest spec/04-perf/99-teardown/
+        make dev # required to install other dependencies like bin/grpcurl
+        source ${{ env.BUILD_ROOT }}/kong-dev-venv.sh
+        bin/busted spec/04-perf/99-teardown/
 
         rm -f ${PERF_TEST_BYO_SSH_KEY_PATH}
 
@@ -260,7 +251,7 @@ jobs:
           inkscape --export-area-drawing --export-png="${i%.*}.png" --export-dpi=300 -b FFFFFF $i
         done
 
-    - uses: actions/setup-python@v4
+    - uses: actions/setup-python@v5
       with:
         python-version: '3.10'
         cache: 'pip'

@@ -62,7 +62,7 @@ end
 -- @param upstream_id string
 -- @return the upstream table, or nil+error
 local function load_upstream_into_memory(upstream_id)
-  local upstream, err = kong.db.upstreams:select({id = upstream_id}, GLOBAL_QUERY_OPTS)
+  local upstream, err = kong.db.upstreams:select({ id = upstream_id }, GLOBAL_QUERY_OPTS)
   if not upstream then
     return nil, err
   end
@@ -105,7 +105,7 @@ local function load_upstreams_dict_into_memory()
   -- please refer to https://github.com/Kong/kong/pull/4301 and
   -- https://github.com/Kong/kong/pull/8974#issuecomment-1317788871
   if isempty(upstreams_dict) then
-    log(DEBUG, "empty upstreams dict. Could it be an uncatched database error?")
+    log(DEBUG, "no upstreams were specified")
   end
 
   return upstreams_dict
@@ -191,11 +191,6 @@ local function do_upstream_event(operation, upstream_data)
     end
 
   elseif operation == "delete" or operation == "update" then
-    local target_cache_key = "balancer:targets:" .. upstream_id
-    if kong.db.strategy ~= "off" then
-      kong.core_cache:invalidate_local(target_cache_key)
-    end
-
     local balancer = balancers.get_balancer_by_id(upstream_id)
     if balancer then
       healthcheckers.stop_healthchecker(balancer, CLEAR_HEALTH_STATUS_DELAY)

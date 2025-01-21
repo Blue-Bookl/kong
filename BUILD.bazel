@@ -1,12 +1,7 @@
-load("@bazel_skylib//rules:common_settings.bzl", "bool_flag")
-load("//build/nfpm:rules.bzl", "nfpm_pkg")
 load("@bazel_skylib//lib:selects.bzl", "selects")
-
-filegroup(
-    name = "srcs",
-    srcs = glob(["**"]),
-    visibility = ["//visibility:public"],
-)
+load("@bazel_skylib//rules:common_settings.bzl", "bool_flag", "string_flag")
+load("//build/nfpm:rules.bzl", "nfpm_pkg")
+load("//build/toolchain:managed_toolchain.bzl", "aarch64_glibc_distros")
 
 filegroup(
     name = "distribution_srcs",
@@ -16,7 +11,10 @@ filegroup(
 
 filegroup(
     name = "rockspec_srcs",
-    srcs = glob(["*.rockspec"]),
+    srcs = glob([
+        "kong/**",
+        "*.rockspec",
+    ]),
     visibility = ["//visibility:public"],
 )
 
@@ -26,63 +24,65 @@ filegroup(
     visibility = ["//visibility:public"],
 )
 
+nfpm_env = {
+    "KONG_NAME": "kong",
+    "KONG_REPLACES_1": "kong-community-edition",
+    "KONG_REPLACES_2": "kong-enterprise-edition-fips",
+    "KONG_CONFLICTS_1": "kong-community-edition",
+    "KONG_CONFLICTS_2": "kong-enterprise-edition-fips",
+}
+
 nfpm_pkg(
     name = "kong_deb",
-    out = "pkg/kong.deb",
     config = "//build:package/nfpm.yaml",
+    env = nfpm_env,
     packager = "deb",
+    pkg_name = "kong",
     visibility = ["//visibility:public"],
 )
 
 nfpm_pkg(
-    name = "kong_apk",
-    out = "pkg/kong.apk.tar.gz",
+    name = "kong_el9",
     config = "//build:package/nfpm.yaml",
-    packager = "apk",
+    env = nfpm_env,
+    packager = "rpm",
+    pkg_name = "kong.el9",
     visibility = ["//visibility:public"],
 )
 
 nfpm_pkg(
     name = "kong_el8",
-    out = "pkg/kong.el8.rpm",
     config = "//build:package/nfpm.yaml",
+    env = nfpm_env,
     packager = "rpm",
-    visibility = ["//visibility:public"],
-)
-
-nfpm_pkg(
-    name = "kong_el7",
-    out = "pkg/kong.el7.rpm",
-    config = "//build:package/nfpm.yaml",
-    env = {
-        "RPM_EXTRA_DEPS": "hostname",
-    },
-    packager = "rpm",
+    pkg_name = "kong.el8",
     visibility = ["//visibility:public"],
 )
 
 nfpm_pkg(
     name = "kong_aws2",
-    out = "pkg/kong.aws2.rpm",
     config = "//build:package/nfpm.yaml",
-    env = {
+    env = nfpm_env,
+    extra_env = {
         "RPM_EXTRA_DEPS": "/usr/sbin/useradd",
         "RPM_EXTRA_DEPS_2": "/usr/sbin/groupadd",
     },
     packager = "rpm",
+    pkg_name = "kong.aws2",
     visibility = ["//visibility:public"],
 )
 
 nfpm_pkg(
-    name = "kong_aws2022",
-    out = "pkg/kong.aws2022.rpm",
+    name = "kong_aws2023",
     config = "//build:package/nfpm.yaml",
-    env = {
+    env = nfpm_env,
+    extra_env = {
         "RPM_EXTRA_DEPS": "/usr/sbin/useradd",
         "RPM_EXTRA_DEPS_2": "/usr/sbin/groupadd",
         "RPM_EXTRA_DEPS_3": "libxcrypt-compat",
     },
     packager = "rpm",
+    pkg_name = "kong.aws2023",
     visibility = ["//visibility:public"],
 )
 
@@ -109,6 +109,34 @@ config_setting(
     ],
     flag_values = {
         ":debug": "true",
+    },
+    visibility = ["//visibility:public"],
+)
+
+# --//:brotli=true
+bool_flag(
+    name = "brotli",
+    build_setting_default = True,
+)
+
+config_setting(
+    name = "brotli_flag",
+    flag_values = {
+        ":brotli": "true",
+    },
+    visibility = ["//visibility:public"],
+)
+
+# --//:simdjson=true
+bool_flag(
+    name = "simdjson",
+    build_setting_default = True,
+)
+
+config_setting(
+    name = "simdjson_flag",
+    flag_values = {
+        ":simdjson": "true",
     },
     visibility = ["//visibility:public"],
 )
@@ -141,74 +169,160 @@ config_setting(
     visibility = ["//visibility:public"],
 )
 
-##### constraints, platforms and config_settings for cross-compile
-
-constraint_setting(name = "libc_version")
-
-constraint_value(
-    name = "glibc_2_35",
-    constraint_setting = ":libc_version",
+# --//:skip_webui=false
+bool_flag(
+    name = "skip_webui",
+    build_setting_default = False,
 )
 
-constraint_value(
-    name = "musl",
-    constraint_setting = ":libc_version",
+config_setting(
+    name = "skip_webui_flags",
+    flag_values = {
+        ":skip_webui": "true",
+    },
     visibility = ["//visibility:public"],
+)
+
+# --//:wasmx=true
+bool_flag(
+    name = "wasmx",
+    build_setting_default = True,
+    visibility = ["//visibility:public"],
+)
+
+# --//:wasmx_module_flag=dynamic
+string_flag(
+    name = "wasmx_module_flag",
+    build_setting_default = "dynamic",
+    values = [
+        "dynamic",
+        "static",
+    ],
+)
+
+config_setting(
+    name = "wasmx_flag",
+    flag_values = {
+        ":wasmx": "true",
+    },
+    visibility = ["//visibility:public"],
+)
+
+config_setting(
+    name = "wasmx_static_mod",
+    flag_values = {
+        ":wasmx": "true",
+        ":wasmx_module_flag": "static",
+    },
+    visibility = ["//visibility:public"],
+)
+
+config_setting(
+    name = "wasmx_dynamic_mod",
+    flag_values = {
+        ":wasmx": "true",
+        ":wasmx_module_flag": "dynamic",
+    },
+    visibility = ["//visibility:public"],
+)
+
+# --//:wasm_runtime=wasmtime
+string_flag(
+    name = "wasm_runtime",
+    build_setting_default = "wasmtime",
+    values = [
+        "v8",
+        "wasmer",
+        "wasmtime",
+    ],
+    visibility = ["//visibility:public"],
+)
+
+# --//:skip_tools=false
+bool_flag(
+    name = "skip_tools",
+    build_setting_default = False,
+)
+
+config_setting(
+    name = "skip_tools_flag",
+    flag_values = {
+        ":skip_tools": "true",
+    },
+    visibility = ["//visibility:public"],
+)
+
+##### constraints, platforms and config_settings for cross-compile
+
+constraint_setting(name = "cross_build_setting")
+
+constraint_value(
+    name = "cross_build",
+    constraint_setting = ":cross_build_setting",
 )
 
 # platform sets the constraint values based on user input (--platform=//:PLATFOTM)
 platform(
-    name = "ubuntu-2204-x86_64",
+    name = "generic-crossbuild-x86_64",
     constraint_values = [
         "@platforms//os:linux",
         "@platforms//cpu:x86_64",
-        ":glibc_2_35",
+        "//build/platforms/distro:generic",
+        ":cross_build",
     ],
 )
 
 platform(
-    name = "ubuntu-2204-arm64",
+    name = "generic-crossbuild-aarch64",
     constraint_values = [
         "@platforms//os:linux",
-        "@platforms//cpu:arm64",
-        ":glibc_2_35",
+        "@platforms//cpu:aarch64",
+        "//build/platforms/distro:generic",
+        ":cross_build",
     ],
 )
 
+[
+    platform(
+        name = vendor + "-crossbuild-aarch64",
+        constraint_values = [
+            "@platforms//os:linux",
+            "@platforms//cpu:aarch64",
+            "//build/platforms/distro:" + vendor,
+            ":cross_build",
+        ],
+    )
+    for vendor in aarch64_glibc_distros
+]
+
 platform(
-    name = "alpine-x86_64",
+    name = "aws2-crossbuild-x86_64",
     constraint_values = [
         "@platforms//os:linux",
         "@platforms//cpu:x86_64",
-        ":musl",
-    ],
-)
-
-platform(
-    name = "macos-arm64",
-    constraint_values = [
-        "@platforms//os:macos",
-        "@platforms//cpu:arm64",
+        "//build/platforms/distro:aws2",
+        ":cross_build",
     ],
 )
 
 # config_settings define a select() condition based on user-set constraint_values
 # see https://bazel.build/docs/configurable-attributes
 config_setting(
-    name = "arm64-linux-gnu-cross",
+    name = "aarch64-linux-glibc-cross",
     constraint_values = [
         "@platforms//os:linux",
-        "@platforms//cpu:arm64",
+        "@platforms//cpu:aarch64",
+        ":cross_build",
     ],
     visibility = ["//visibility:public"],
 )
 
 config_setting(
-    name = "x86_64-linux-musl-cross",
+    name = "x86_64-linux-glibc-cross",
     constraint_values = [
         "@platforms//os:linux",
         "@platforms//cpu:x86_64",
-        ":musl",
+        ":cross_build",
     ],
     visibility = ["//visibility:public"],
 )
@@ -217,8 +331,8 @@ selects.config_setting_group(
     # matches all cross build platforms
     name = "any-cross",
     match_any = [
-        ":arm64-linux-gnu-cross",
-        ":x86_64-linux-musl-cross",
+        ":aarch64-linux-glibc-cross",
+        ":x86_64-linux-glibc-cross",
     ],
     visibility = ["//visibility:public"],
 )

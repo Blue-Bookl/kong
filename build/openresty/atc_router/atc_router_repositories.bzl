@@ -1,14 +1,12 @@
-"""A module defining the third party dependency PCRE"""
+"""A module defining the dependency atc-router"""
 
-load("@bazel_tools//tools/build_defs/repo:git.bzl", "git_repository")
-load("@bazel_tools//tools/build_defs/repo:utils.bzl", "maybe")
 load("@kong_bindings//:variables.bzl", "KONG_VAR")
+load("//build:build_system.bzl", "git_or_local_repository")
 
 def atc_router_repositories():
-    maybe(
-        git_repository,
+    git_or_local_repository(
         name = "atc_router",
-        branch = KONG_VAR["ATC_ROUTER_VERSION"],
+        branch = KONG_VAR["ATC_ROUTER"],
         remote = "https://github.com/Kong/atc-router",
-        visibility = ["//visibility:public"],  # let this to be referenced by openresty build
+        build_file = "//build/openresty/atc_router:BUILD.atc_router.bazel",
     )
