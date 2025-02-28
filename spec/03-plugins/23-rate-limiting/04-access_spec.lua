@@ -1,5 +1,6 @@
 local helpers           = require "spec.helpers"
 local cjson             = require "cjson"
+local redis_helper      = require "spec.helpers.redis_helper"
 
 
 local REDIS_HOST        = helpers.redis_host
@@ -15,7 +16,10 @@ local UPSTREAM_URL      = string.format("http://%s:%d/always_200", UPSTREAM_HOST
 local fmt               = string.format
 local proxy_client      = helpers.proxy_client
 local table_insert      = table.insert
+local tonumber          = tonumber
 
+local ngx_sleep         = ngx.sleep
+local ngx_now           = ngx.now
 
 
 -- This performs the test up to two times (and no more than two).
@@ -29,7 +33,7 @@ local table_insert      = table.insert
 -- was an actual problem detected by the test.
 local function retry(fn)
   if not pcall(fn) then
-    ngx.sleep(61 - (ngx.now() % 60))  -- Wait for minute to expire
+    ngx_sleep(61 - (ngx_now() % 60))  -- Wait for minute to expire
     fn()
   end
 end
@@ -48,32 +52,6 @@ local function GET(url, opt)
   client:close()
 
   return res
-end
-
-
-local function flush_redis()
-  local redis = require "resty.redis"
-  local red = assert(redis:new())
-  red:set_timeout(2000)
-  local ok, err = red:connect(REDIS_HOST, REDIS_PORT)
-  if not ok then
-    error("failed to connect to Redis: " .. err)
-  end
-
-  if REDIS_PASSWORD and REDIS_PASSWORD ~= "" then
-    local ok, err = red:auth(REDIS_PASSWORD)
-    if not ok then
-      error("failed to connect to Redis: " .. err)
-    end
-  end
-
-  local ok, err = red:select(REDIS_DATABASE)
-  if not ok then
-    error("failed to change Redis database: " .. err)
-  end
-
-  red:flushall()
-  red:close()
 end
 
 
@@ -405,7 +383,7 @@ describe(desc, function()
     _, db = helpers.get_db_utils(strategy, nil, { "rate-limiting", "key-auth" })
 
     if policy == "redis" then
-      flush_redis()
+      redis_helper.reset_redis(REDIS_HOST, REDIS_PORT)
 
     elseif policy == "cluster" then
       db:truncate("ratelimiting_metrics")
@@ -438,7 +416,7 @@ describe(desc, function()
     end
 
     if policy == "redis" then
-      flush_redis()
+      redis_helper.reset_redis(REDIS_HOST, REDIS_PORT)
     end
   end)
 
@@ -460,13 +438,15 @@ describe(desc, function()
       limit_by            = limit_by,
       path                = test_path,                  -- only for limit_by = "path"
       header_name         = test_header,                -- only for limit_by = "header"
-      redis_host          = REDIS_HOST,
-      redis_port          = ssl_conf.redis_port,
-      redis_password      = REDIS_PASSWORD,
-      redis_database      = REDIS_DATABASE,
-      redis_ssl           = ssl_conf.redis_ssl,
-      redis_ssl_verify    = ssl_conf.redis_ssl_verify,
-      redis_server_name   = ssl_conf.redis_server_name,
+      redis = {
+        host          = REDIS_HOST,
+        port          = ssl_conf.redis_port,
+        password      = REDIS_PASSWORD,
+        database      = REDIS_DATABASE,
+        ssl           = ssl_conf.redis_ssl,
+        ssl_verify    = ssl_conf.redis_ssl_verify,
+        server_name   = ssl_conf.redis_server_name,
+      }
     }, service)
 
     local auth_plugin
@@ -531,13 +511,15 @@ if limit_by == "ip" then
       minute              = 6,
       policy              = policy,
       limit_by            = "ip",
-      redis_host          = REDIS_HOST,
-      redis_port          = ssl_conf.redis_port,
-      redis_password      = REDIS_PASSWORD,
-      redis_database      = REDIS_DATABASE,
-      redis_ssl           = ssl_conf.redis_ssl,
-      redis_ssl_verify    = ssl_conf.redis_ssl_verify,
-      redis_server_name   = ssl_conf.redis_server_name,
+      redis = {
+        host          = REDIS_HOST,
+        port          = ssl_conf.redis_port,
+        password      = REDIS_PASSWORD,
+        database      = REDIS_DATABASE,
+        ssl           = ssl_conf.redis_ssl,
+        ssl_verify    = ssl_conf.redis_ssl_verify,
+        server_name   = ssl_conf.redis_server_name,
+      }
     }, service)
 
     finally(function()
@@ -569,13 +551,15 @@ if limit_by == "ip" then
       minute              = 6,
       policy              = policy,
       limit_by            = "ip",
-      redis_host          = REDIS_HOST,
-      redis_port          = ssl_conf.redis_port,
-      redis_password      = REDIS_PASSWORD,
-      redis_database      = REDIS_DATABASE,
-      redis_ssl           = ssl_conf.redis_ssl,
-      redis_ssl_verify    = ssl_conf.redis_ssl_verify,
-      redis_server_name   = ssl_conf.redis_server_name,
+      redis = {
+        host          = REDIS_HOST,
+        port          = ssl_conf.redis_port,
+        password      = REDIS_PASSWORD,
+        database      = REDIS_DATABASE,
+        ssl           = ssl_conf.redis_ssl,
+        ssl_verify    = ssl_conf.redis_ssl_verify,
+        server_name   = ssl_conf.redis_server_name,
+      }
     }, service)
 
     finally(function()
@@ -612,7 +596,7 @@ if limit_by == "ip" then
         helpers.wait_timer("rate-limiting", true, "any-finish")
       end
 
-      -- Additonal request, while limit is 6/minute
+      -- Additional request, while limit is 6/minute
       local ok, res = helpers.proxy_client_grpc(){
         service = "hello.HelloService.SayHello",
         opts = {
@@ -643,13 +627,15 @@ if limit_by == "ip" then
       policy              = policy,
       limit_by            = "ip",
       hide_client_headers = true,
-      redis_host          = REDIS_HOST,
-      redis_port          = ssl_conf.redis_port,
-      redis_password      = REDIS_PASSWORD,
-      redis_database      = REDIS_DATABASE,
-      redis_ssl           = ssl_conf.redis_ssl,
-      redis_ssl_verify    = ssl_conf.redis_ssl_verify,
-      redis_server_name   = ssl_conf.redis_server_name,
+      redis = {
+        host          = REDIS_HOST,
+        port          = ssl_conf.redis_port,
+        password      = REDIS_PASSWORD,
+        database      = REDIS_DATABASE,
+        ssl           = ssl_conf.redis_ssl,
+        ssl_verify    = ssl_conf.redis_ssl_verify,
+        server_name   = ssl_conf.redis_server_name,
+      }
     }, service)
 
     finally(function()
@@ -664,7 +650,22 @@ if limit_by == "ip" then
     })
 
     local res = assert(GET(test_path))
+    assert.res_status(200, res)
 
+    assert.is_nil(res.headers["X-Ratelimit-Limit-Minute"])
+    assert.is_nil(res.headers["X-Ratelimit-Remaining-Minute"])
+    assert.is_nil(res.headers["Ratelimit-Limit"])
+    assert.is_nil(res.headers["Ratelimit-Remaining"])
+    assert.is_nil(res.headers["Ratelimit-Reset"])
+    assert.is_nil(res.headers["Retry-After"])
+
+    -- repeat until get rate-limited
+    helpers.wait_until(function()
+      res = assert(GET(test_path))
+      return res.status == 429, "should be rate-limited (429), got " .. res.status
+    end, 10)
+
+    assert.res_status(429, res)
     assert.is_nil(res.headers["X-Ratelimit-Limit-Minute"])
     assert.is_nil(res.headers["X-Ratelimit-Remaining-Minute"])
     assert.is_nil(res.headers["Ratelimit-Limit"])
@@ -686,13 +687,15 @@ if limit_by == "ip" then
       limit_by            = limit_by,
       path                = test_path,
       header_name         = test_header,
-      redis_host          = REDIS_HOST,
-      redis_port          = ssl_conf.redis_port,
-      redis_password      = REDIS_PASSWORD,
-      redis_database      = REDIS_DATABASE,
-      redis_ssl           = ssl_conf.redis_ssl,
-      redis_ssl_verify    = ssl_conf.redis_ssl_verify,
-      redis_server_name   = ssl_conf.redis_server_name,
+      redis = {
+        host          = REDIS_HOST,
+        port          = ssl_conf.redis_port,
+        password      = REDIS_PASSWORD,
+        database      = REDIS_DATABASE,
+        ssl           = ssl_conf.redis_ssl,
+        ssl_verify    = ssl_conf.redis_ssl_verify,
+        server_name   = ssl_conf.redis_server_name,
+      }
     }, service)
 
     finally(function()
@@ -722,17 +725,18 @@ if limit_by == "ip" then
     local service = setup_service(admin_client, UPSTREAM_URL)
     local route = setup_route(admin_client, service, { test_path })
     local rl_plugin = setup_rl_plugin(admin_client, {
-      minute              = 6,
+      second              = 1,
       policy              = policy,
-      limit_by            = limit_by,
-      path                = test_path,
-      redis_host          = REDIS_HOST,
-      redis_port          = ssl_conf.redis_port,
-      redis_password      = REDIS_PASSWORD,
-      redis_database      = REDIS_DATABASE,
-      redis_ssl           = ssl_conf.redis_ssl,
-      redis_ssl_verify    = ssl_conf.redis_ssl_verify,
-      redis_server_name   = ssl_conf.redis_server_name,
+      limit_by            = "ip",
+      redis = {
+        host          = REDIS_HOST,
+        port          = ssl_conf.redis_port,
+        password      = REDIS_PASSWORD,
+        database      = REDIS_DATABASE,
+        ssl           = ssl_conf.redis_ssl,
+        ssl_verify    = ssl_conf.redis_ssl_verify,
+        server_name   = ssl_conf.redis_server_name,
+      }
     }, service)
 
     finally(function()
@@ -746,21 +750,32 @@ if limit_by == "ip" then
       override_global_key_auth_plugin = true,
     })
 
-    local function proxy_fn()
-      return GET(test_path)
-    end
+    assert
+      .with_timeout(15)
+      .with_max_tries(10)
+      .with_step(0.5) -- the windows is 1 second, we wait 0.5 seconds between each retry,
+                      -- that can avoid some unlucky case (we are at the end of the window)
+      .ignore_exceptions(false)
+      .eventually(function()
+        local res1 = GET(test_path, { headers = { ["X-Real-IP"] = "127.0.0.3" }})
+        assert.res_status(200, res1)
+        assert.are.same(1, tonumber(res1.headers["RateLimit-Limit"]))
+        assert.are.same(0, tonumber(res1.headers["RateLimit-Remaining"]))
+        assert.is_true(tonumber(res1.headers["ratelimit-reset"]) >= 0)
+        assert.are.same(1, tonumber(res1.headers["X-RateLimit-Limit-Second"]))
+        assert.are.same(0, tonumber(res1.headers["X-RateLimit-Remaining-Second"]))
 
-    local t = 61 - (ngx.now() % 60)
+        local res2 = GET(test_path, { headers = { ["X-Real-IP"] = "127.0.0.3" }})
+        local body2 = assert.res_status(429, res2)
+        local json2 = cjson.decode(body2)
+        assert.not_nil(json2.message)
+        assert.matches("API rate limit exceeded", json2.message)
 
-    retry(function ()
-      validate_headers(client_requests(7, proxy_fn), true, true)
-      t = 61 - (ngx.now() % 60)
-    end)
-
-    -- wait for the counter to expire
-    ngx.sleep(t)
-
-    validate_headers(client_requests(7, proxy_fn), true, true)
+        ngx_sleep(1)
+        local res3 = GET(test_path, { headers = { ["X-Real-IP"] = "127.0.0.3" }})
+        assert.res_status(200, res3)
+      end)
+      .has_no_error("counter should have been cleared after current window")
   end)
 
   it("blocks with a custom error code and message", function()
@@ -773,13 +788,15 @@ if limit_by == "ip" then
       policy              = policy,
       limit_by            = limit_by,
       path                = test_path,
-      redis_host          = REDIS_HOST,
-      redis_port          = ssl_conf.redis_port,
-      redis_password      = REDIS_PASSWORD,
-      redis_database      = REDIS_DATABASE,
-      redis_ssl           = ssl_conf.redis_ssl,
-      redis_ssl_verify    = ssl_conf.redis_ssl_verify,
-      redis_server_name   = ssl_conf.redis_server_name,
+      redis = {
+        host          = REDIS_HOST,
+        port          = ssl_conf.redis_port,
+        password      = REDIS_PASSWORD,
+        database      = REDIS_DATABASE,
+        ssl           = ssl_conf.redis_ssl,
+        ssl_verify    = ssl_conf.redis_ssl_verify,
+        server_name   = ssl_conf.redis_server_name,
+      },
       error_code          = 404,
       error_message       = "Fake Not Found",
     }, service)
@@ -802,7 +819,7 @@ if limit_by == "ip" then
 
     res = GET(test_path)
     local json = cjson.decode(assert.res_status(404, res))
-    assert.equal("Fake Not Found", json.message)
+    assert.matches("Fake Not Found", json.message)
 
   end)      -- it("blocks with a custom error code and message", function()
 end         -- if limit_by == "ip" then
@@ -819,13 +836,15 @@ if limit_by == "service" then
       minute              = 6,
       policy              = policy,
       limit_by            = "service",
-      redis_host          = REDIS_HOST,
-      redis_port          = ssl_conf.redis_port,
-      redis_password      = REDIS_PASSWORD,
-      redis_database      = REDIS_DATABASE,
-      redis_ssl           = ssl_conf.redis_ssl,
-      redis_ssl_verify    = ssl_conf.redis_ssl_verify,
-      redis_server_name   = ssl_conf.redis_server_name,
+      redis = {
+        host          = REDIS_HOST,
+        port          = ssl_conf.redis_port,
+        password      = REDIS_PASSWORD,
+        database      = REDIS_DATABASE,
+        ssl           = ssl_conf.redis_ssl,
+        ssl_verify    = ssl_conf.redis_ssl_verify,
+        server_name   = ssl_conf.redis_server_name,
+      }
     })
 
     finally(function()
@@ -863,13 +882,15 @@ if limit_by == "path" then
       policy              = policy,
       limit_by            = "path",
       path                = test_path_1,
-      redis_host          = REDIS_HOST,
-      redis_port          = ssl_conf.redis_port,
-      redis_password      = REDIS_PASSWORD,
-      redis_database      = REDIS_DATABASE,
-      redis_ssl           = ssl_conf.redis_ssl,
-      redis_ssl_verify    = ssl_conf.redis_ssl_verify,
-      redis_server_name   = ssl_conf.redis_server_name,
+      redis = {
+        host          = REDIS_HOST,
+        port          = ssl_conf.redis_port,
+        password      = REDIS_PASSWORD,
+        database      = REDIS_DATABASE,
+        ssl           = ssl_conf.redis_ssl,
+        ssl_verify    = ssl_conf.redis_ssl_verify,
+        server_name   = ssl_conf.redis_server_name,
+      }
     }, service)
 
     finally(function()
@@ -907,13 +928,15 @@ if limit_by == "header" then
       policy              = policy,
       limit_by            = "header",
       header_name         = test_header_1,
-      redis_host          = REDIS_HOST,
-      redis_port          = ssl_conf.redis_port,
-      redis_password      = REDIS_PASSWORD,
-      redis_database      = REDIS_DATABASE,
-      redis_ssl           = ssl_conf.redis_ssl,
-      redis_ssl_verify    = ssl_conf.redis_ssl_verify,
-      redis_server_name   = ssl_conf.redis_server_name,
+      redis = {
+        host          = REDIS_HOST,
+        port          = ssl_conf.redis_port,
+        password      = REDIS_PASSWORD,
+        database      = REDIS_DATABASE,
+        ssl           = ssl_conf.redis_ssl,
+        ssl_verify    = ssl_conf.redis_ssl_verify,
+        server_name   = ssl_conf.redis_server_name,
+      }
     }, service)
 
     finally(function()
@@ -950,13 +973,15 @@ if limit_by == "consumer" or limit_by == "credential" then
       minute              = 6,
       policy              = policy,
       limit_by            = limit_by,
-      redis_host          = REDIS_HOST,
-      redis_port          = ssl_conf.redis_port,
-      redis_password      = REDIS_PASSWORD,
-      redis_database      = REDIS_DATABASE,
-      redis_ssl           = ssl_conf.redis_ssl,
-      redis_ssl_verify    = ssl_conf.redis_ssl_verify,
-      redis_server_name   = ssl_conf.redis_server_name,
+      redis = {
+        host          = REDIS_HOST,
+        port          = ssl_conf.redis_port,
+        password      = REDIS_PASSWORD,
+        database      = REDIS_DATABASE,
+        ssl           = ssl_conf.redis_ssl,
+        ssl_verify    = ssl_conf.redis_ssl_verify,
+        server_name   = ssl_conf.redis_server_name,
+      }
     }, service)
     local auth_plugin = setup_key_auth_plugin(admin_client, {
       key_names = { test_key_name },
@@ -1040,7 +1065,7 @@ describe(desc, function ()
     _, db = helpers.get_db_utils(strategy, nil, { "rate-limiting", "key-auth" })
 
     if policy == "redis" then
-      flush_redis()
+      redis_helper.reset_redis(REDIS_HOST, REDIS_PORT)
 
     elseif policy == "cluster" then
       db:truncate("ratelimiting_metrics")
@@ -1099,7 +1124,8 @@ if policy == "cluster" then
     local res = assert(GET(test_path))
     local body = assert.res_status(500, res)
     local json = cjson.decode(body)
-    assert.same({ message = "An unexpected error occurred" }, json)
+    assert.not_nil(json)
+    assert.matches("An unexpected error occurred", json.message)
 
     assert.falsy(res.headers["X-Ratelimit-Limit-Minute"])
     assert.falsy(res.headers["X-Ratelimit-Remaining-Minute"])
@@ -1156,9 +1182,11 @@ if policy == "redis" then
       minute              = 6,
       policy              = "redis",
       limit_by            = "ip",
-      redis_host          = "127.0.0.1",
-      redis_port          = 80,                   -- bad redis port
-      redis_ssl           = false,
+      redis = {
+        host          = "127.0.0.1",
+        port          = 80,                     -- bad redis port
+        ssl           = false,
+      },
       fault_tolerant      = false,
     }, service)
 
@@ -1170,7 +1198,8 @@ if policy == "redis" then
     local res = assert(GET(test_path))
     local body = assert.res_status(500, res)
     local json = cjson.decode(body)
-    assert.same({ message = "An unexpected error occurred" }, json)
+    assert.not_nil(json)
+    assert.matches("An unexpected error occurred", json.message)
 
     assert.falsy(res.headers["X-Ratelimit-Limit-Minute"])
     assert.falsy(res.headers["X-Ratelimit-Remaining-Minute"])
@@ -1184,9 +1213,11 @@ if policy == "redis" then
       minute              = 6,
       policy              = "redis",
       limit_by            = "ip",
-      redis_host          = "127.0.0.1",
-      redis_port          = 80,                   -- bad redis port
-      redis_ssl           = false,
+      redis = {
+        host          = "127.0.0.1",
+        port          = 80,                     -- bad redis port
+        ssl           = false,
+      },
       fault_tolerant      = true,
     }, service)
 
@@ -1208,6 +1239,114 @@ if policy == "redis" then
 end     -- if policy == "redis" then
 
 end)
+
+if policy == "redis" then
+
+desc = fmt("Plugin: rate-limiting with sync_rate #db (access) [strategy: %s]", strategy)
+
+describe(desc, function ()
+  local https_server, admin_client
+
+  lazy_setup(function()
+    helpers.get_db_utils(strategy, nil, {
+      "rate-limiting",
+    })
+
+    https_server = helpers.https_server.new(UPSTREAM_PORT)
+    https_server:start()
+
+    assert(helpers.start_kong({
+      database   = strategy,
+      nginx_conf = "spec/fixtures/custom_nginx.template",
+      plugins = "bundled,rate-limiting,key-auth",
+      trusted_ips = "0.0.0.0/0,::/0",
+      lua_ssl_trusted_certificate = "spec/fixtures/redis/ca.crt",
+      log_level = "error"
+    }))
+
+  end)
+
+  lazy_teardown(function()
+    https_server:shutdown()
+    assert(helpers.stop_kong())
+  end)
+
+  before_each(function()
+    redis_helper.reset_redis(REDIS_HOST, REDIS_PORT)
+    admin_client = helpers.admin_client()
+  end)
+
+  after_each(function()
+    admin_client:close()
+  end)
+
+  it("blocks if exceeding limit", function ()
+    local test_path = "/test"
+
+    local service = setup_service(admin_client, UPSTREAM_URL)
+    local route = setup_route(admin_client, service, { test_path })
+    local rl_plugin = setup_rl_plugin(admin_client, {
+      minute              = 6,
+      policy              = "redis",
+      limit_by            = "ip",
+      redis = {
+        host          = REDIS_HOST,
+        port          = REDIS_PORT,
+        password      = REDIS_PASSWORD,
+        database      = REDIS_DATABASE,
+        ssl           = false,
+      },
+      sync_rate           = 10,
+    }, service)
+    local red = redis_helper.connect(REDIS_HOST, REDIS_PORT)
+    local ok, err = red:select(REDIS_DATABASE)
+    if not ok then
+      error("failed to change Redis database: " .. err)
+    end
+
+    finally(function()
+      delete_plugin(admin_client, rl_plugin)
+      delete_route(admin_client, route)
+      delete_service(admin_client, service)
+      red:close()
+      local shell = require "resty.shell"
+      shell.run("cat servroot/logs/error.log", nil, 0)
+    end)
+
+    helpers.wait_for_all_config_update({
+      override_global_rate_limiting_plugin = true,
+    })
+
+    -- initially, the metrics are not written to the redis
+    assert(red:dbsize() == 0, "redis db should be empty, but got " .. red:dbsize())
+
+    retry(function ()
+      -- exceed the limit
+      for _i = 0, 7 do
+        GET(test_path)
+      end
+
+      -- exceed the limit locally
+      assert.res_status(429, GET(test_path))
+
+      -- wait for the metrics to be written to the redis
+      helpers.pwait_until(function()
+        GET(test_path)
+        assert(red:dbsize() == 1, "redis db should have 1 key, but got " .. red:dbsize())
+      end, 15)
+
+      -- wait for the metrics expire
+      helpers.pwait_until(function()
+        assert.res_status(200, GET(test_path))
+      end, 61)
+
+    end)
+
+  end)  -- it("blocks if exceeding limit", function ()
+
+end)
+
+end     -- if policy == "redis" then
 
 end     -- for __, policy in ipairs({ "local", "cluster", "redis" }) do
 
@@ -1265,11 +1404,13 @@ describe(desc, function ()
       minute              = 6,
       policy              = "local",
       limit_by            = "credential",
-      redis_host          = REDIS_HOST,
-      redis_port          = REDIS_PORT,
-      redis_password      = REDIS_PASSWORD,
-      redis_database      = REDIS_DATABASE,
-      redis_ssl           = false,
+      redis = {
+        host          = REDIS_HOST,
+        port          = REDIS_PORT,
+        password      = REDIS_PASSWORD,
+        database      = REDIS_DATABASE,
+        ssl           = false,
+      }
     })
     local credential = setup_credential(admin_client, consumer, test_credential)
 

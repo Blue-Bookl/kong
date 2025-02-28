@@ -1,10 +1,3 @@
--- This software is copyright Kong Inc. and its licensors.
--- Use of the software is subject to the agreement between your organization
--- and Kong Inc. If there is no such agreement, use is governed by and
--- subject to the terms of the Kong Master Software License Agreement found
--- at https://konghq.com/enterprisesoftwarelicense/.
--- [ END OF LICENSE 0867164ffc95e54f04670b5169c09574bdbd9bba ]
-
 local helpers = require "spec.helpers"
 local cjson = require "cjson"
 local merge = kong.table.merge
@@ -34,7 +27,7 @@ for _, strategy in helpers.all_strategies() do
     end)
 
     lazy_teardown(function()
-      helpers.stop_kong(nil, true)
+      helpers.stop_kong()
     end)
 
     before_each(function()
@@ -117,6 +110,20 @@ for _, strategy in helpers.all_strategies() do
           local key_body = assert.res_status(201, j_key)
           test_jwk_key = cjson.decode(key_body)
         end)
+
+        it("create invalid JWK", function()
+          local j_key = helpers.admin_client():post("/keys", {
+            headers = HEADERS,
+            body = {
+              name = "jwk invalid",
+              jwk = '{"kid": "36"}',
+              kid = "36"
+            }
+          })
+          local key_body = assert.res_status(400, j_key)
+          local jwk_key = cjson.decode(key_body)
+          assert.equal('schema violation (could not load JWK, likely not a valid key)', jwk_key.message)
+        end)
       end)
 
 
@@ -187,7 +194,7 @@ for _, strategy in helpers.all_strategies() do
           local d_res = client:delete("/key-sets/"..json.data[1].id)
           assert.res_status(204, d_res)
 
-          -- assert keys assinged to the key-set were deleted (by cascade)
+          -- assert keys assigned to the key-set were deleted (by cascade)
           local _res = client:get("/keys")
           local _body = assert.res_status(200, _res)
           local _json = cjson.decode(_body)

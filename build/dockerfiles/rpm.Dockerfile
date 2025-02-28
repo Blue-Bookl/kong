@@ -1,5 +1,5 @@
-ARG KONG_BASE_IMAGE=redhat/ubi8
-FROM $KONG_BASE_IMAGE
+ARG KONG_BASE_IMAGE=redhat/ubi9
+FROM --platform=$TARGETPLATFORM $KONG_BASE_IMAGE
 
 LABEL maintainer="Kong Docker Maintainers <docker@konghq.com> (@team-gateway-bot)"
 
@@ -18,17 +18,22 @@ LABEL name="Kong" \
 # RedHat required LICENSE file approved path
 COPY LICENSE /licenses/
 
+ARG RPM_PLATFORM=el9
+
 ARG KONG_PREFIX=/usr/local/kong
 ENV KONG_PREFIX $KONG_PREFIX
 
 ARG EE_PORTS
 
-ARG KONG_ARTIFACT=kong.rpm
-COPY ${KONG_ARTIFACT} /tmp/kong.rpm
+ARG TARGETARCH
+
+ARG KONG_ARTIFACT=kong.${RPM_PLATFORM}.${TARGETARCH}.rpm
+ARG KONG_ARTIFACT_PATH
 
 # hadolint ignore=DL3015
-RUN yum install -y /tmp/kong.rpm \
-    && rm /tmp/kong.rpm \
+RUN --mount=type=bind,source=${KONG_ARTIFACT_PATH},target=/tmp/pkg \
+    yum update -y \
+    && yum install -y /tmp/pkg/${KONG_ARTIFACT} \
     && chown kong:0 /usr/local/bin/kong \
     && chown -R kong:0 /usr/local/kong \
     && ln -sf /usr/local/openresty/bin/resty /usr/local/bin/resty \
@@ -47,6 +52,6 @@ EXPOSE 8000 8443 8001 8444 $EE_PORTS
 
 STOPSIGNAL SIGQUIT
 
-HEALTHCHECK --interval=60s --timeout=10s --retries=10 CMD kong health
+HEALTHCHECK --interval=60s --timeout=10s --retries=10 CMD kong-health
 
 CMD ["kong", "docker-start"]

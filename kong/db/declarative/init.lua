@@ -1,7 +1,6 @@
 local pl_file = require "pl.file"
 local lyaml = require "lyaml"
 local cjson = require "cjson.safe"
-local utils = require "kong.tools.utils"
 local declarative_config = require "kong.db.schema.others.declarative_config"
 local on_the_fly_migration = require "kong.db.declarative.migrations.route_path"
 local declarative_import = require "kong.db.declarative.import"
@@ -17,7 +16,7 @@ local type = type
 local null = ngx.null
 local md5 = ngx.md5
 local pairs = pairs
-local yield = utils.yield
+local yield = require("kong.tools.yield").yield
 local cjson_decode = cjson.decode
 local cjson_encode = cjson.encode
 local convert_nulls = declarative_export.convert_nulls
@@ -74,6 +73,7 @@ local function pretty_print_error(err_t, item, indent)
 end
 
 
+
 -- @treturn table|nil a table with the following format:
 --   {
 --     services: {
@@ -103,35 +103,7 @@ function _M:parse_file(filename, old_hash)
 end
 
 
--- @treturn table|nil a table with the following format:
---   {
---     services: {
---       ["<uuid>"] = { ... },
---       ...
---     },
-
---   }
--- @tparam string contents the json/yml/lua being parsed
--- @tparam string|nil filename. If nil, json will be tried first, then yaml
--- @tparam string|nil old_hash used to avoid loading the same content more than once, if present
--- @treturn nil|string error message, only if error happened
--- @treturn nil|table err_t, only if error happened
--- @treturn table|nil a table with the following format:
---   {
---     _format_version: "2.1",
---     _transform: true,
---   }
-function _M:parse_string(contents, filename, old_hash)
-  -- we don't care about the strength of the hash
-  -- because declarative config is only loaded by Kong administrators,
-  -- not outside actors that could exploit it for collisions
-  local new_hash = md5(contents)
-
-  if old_hash and old_hash == new_hash then
-    local err = "configuration is identical"
-    return nil, err, { error = err }, nil
-  end
-
+function _M:unserialize(contents, filename)
   local tried_one = false
   local dc_table, err
   if filename == nil or filename:match("json$")
@@ -168,7 +140,46 @@ function _M:parse_string(contents, filename, old_hash)
       err = "failed parsing declarative configuration" .. (err and (": " .. err) or "")
     end
 
-    return nil, err, { error = err }
+    return nil, err, { error = err }, nil
+  end
+
+  -- we don't care about the strength of the hash
+  -- because declarative config is only loaded by Kong administrators,
+  -- not outside actors that could exploit it for collisions
+  local new_hash = md5(contents)
+
+  return dc_table, nil, nil, new_hash
+end
+
+
+-- @treturn table|nil a table with the following format:
+--   {
+--     services: {
+--       ["<uuid>"] = { ... },
+--       ...
+--     },
+
+--   }
+-- @tparam string contents the json/yml/lua being parsed
+-- @tparam string|nil filename. If nil, json will be tried first, then yaml
+-- @tparam string|nil old_hash used to avoid loading the same content more than once, if present
+-- @treturn nil|string error message, only if error happened
+-- @treturn nil|table err_t, only if error happened
+-- @treturn table|nil a table with the following format:
+--   {
+--     _format_version: "2.1",
+--     _transform: true,
+--   }
+function _M:parse_string(contents, filename, old_hash)
+  local dc_table, err, err_t, new_hash = self:unserialize(contents, filename)
+
+  if not dc_table then
+    return nil, err, err_t
+  end
+
+  if old_hash and old_hash == new_hash then
+    err = "configuration is identical"
+    return nil, err, { error = err }, nil
   end
 
   return self:parse_table(dc_table, new_hash)
@@ -207,12 +218,12 @@ function _M:parse_table(dc_table, hash)
     error("expected a table as input", 2)
   end
 
+  on_the_fly_migration(dc_table)
+
   local entities, err_t, meta = self.schema:flatten(dc_table)
   if err_t then
     return nil, pretty_print_error(err_t), err_t
   end
-
-  on_the_fly_migration(entities, dc_table._format_version)
 
   yield()
 
@@ -234,15 +245,26 @@ _M.to_yaml_file                = declarative_export.to_yaml_file
 _M.export_from_db              = declarative_export.export_from_db
 _M.export_config               = declarative_export.export_config
 _M.export_config_proto         = declarative_export.export_config_proto
+_M.export_config_sync          = declarative_export.export_config_sync
 _M.sanitize_output             = declarative_export.sanitize_output
 
 
 -- import
 _M.get_current_hash            = declarative_import.get_current_hash
 _M.unique_field_key            = declarative_import.unique_field_key
+_M.item_key                    = declarative_import.item_key
+_M.item_key_prefix             = declarative_import.item_key_prefix
+_M.foreign_field_key_prefix    = declarative_import.foreign_field_key_prefix
 _M.load_into_db                = declarative_import.load_into_db
 _M.load_into_cache             = declarative_import.load_into_cache
 _M.load_into_cache_with_events = declarative_import.load_into_cache_with_events
+_M.insert_entity_for_txn       = declarative_import.insert_entity_for_txn
+_M.delete_entity_for_txn       = declarative_import.delete_entity_for_txn
+_M.workspace_id                = declarative_import.workspace_id
+_M.GLOBAL_WORKSPACE_TAG        = declarative_import.GLOBAL_WORKSPACE_TAG
+
+-- helpful function
+_M.pretty_print_error          = pretty_print_error
 
 
 return _M

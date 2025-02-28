@@ -6,9 +6,7 @@ load("@bazel_skylib//lib:dicts.bzl", "dicts")
 load("@kong_bindings//:variables.bzl", "KONG_VAR")
 
 def _nfpm_pkg_impl(ctx):
-    out = ctx.actions.declare_file(ctx.attr.out)
-
-    env = dicts.add(ctx.attr.env, KONG_VAR, ctx.configuration.default_shell_env)
+    env = dicts.add(ctx.attr.env, ctx.attr.extra_env, KONG_VAR, ctx.configuration.default_shell_env)
 
     target_cpu = ctx.attr._cc_toolchain[cc_common.CcToolchainInfo].cpu
     if target_cpu == "k8" or target_cpu == "x86_64" or target_cpu == "amd64":
@@ -22,16 +20,28 @@ def _nfpm_pkg_impl(ctx):
     # XXX: remove the "env" from KONG_VAR which is a list
     env["OPENRESTY_PATCHES"] = ""
 
+    pkg_ext = ctx.attr.packager
+
+    # create like kong.amd64.deb
+    out = ctx.actions.declare_file("%s/%s.%s.%s" % (
+        ctx.attr.out_dir,
+        ctx.attr.pkg_name,
+        target_arch,
+        pkg_ext,
+    ))
+
     nfpm_args = ctx.actions.args()
     nfpm_args.add("pkg")
     nfpm_args.add("-f", ctx.file.config.path)
     nfpm_args.add("-p", ctx.attr.packager)
     nfpm_args.add("-t", out.path)
 
+    build_destdir = ctx.var["BINDIR"] + "/build/" + KONG_VAR["BUILD_NAME"]
+
     ctx.actions.run_shell(
         inputs = ctx.files._nfpm_bin,
         mnemonic = "nFPM",
-        command = "ln -sf %s nfpm-prefix; external/nfpm/nfpm $@" % KONG_VAR["BUILD_DESTDIR"],
+        command = "ln -sf %s nfpm-prefix; external/nfpm/nfpm $@" % build_destdir,
         arguments = [nfpm_args],
         outputs = [out],
         env = env,
@@ -55,9 +65,17 @@ nfpm_pkg = rule(
         "env": attr.string_dict(
             doc = "Environment variables to set when running nFPM.",
         ),
-        "out": attr.string(
+        "extra_env": attr.string_dict(
+            # https://github.com/bazelbuild/bazel/issues/12457
+            doc = "Additional environment variables to set when running nFPM. This is a workaround since Bazel doesn't support union operator for select yet.",
+        ),
+        "pkg_name": attr.string(
             mandatory = True,
-            doc = "Output file name.",
+            doc = "Output package name.",
+        ),
+        "out_dir": attr.string(
+            doc = "Output directory name.",
+            default = "pkg",
         ),
         # hidden attributes
         "_nfpm_bin": attr.label(

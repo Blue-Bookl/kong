@@ -44,9 +44,26 @@ if [[ "$1" == "kong" ]]; then
   if [[ "$2" == "docker-start" ]]; then
     kong prepare -p "$PREFIX" "$@"
 
-    ln -sf /dev/stdout $PREFIX/logs/access.log
-    ln -sf /dev/stdout $PREFIX/logs/admin_access.log
-    ln -sf /dev/stderr $PREFIX/logs/error.log
+    # remove all dangling sockets in $PREFIX dir before starting Kong
+    LOGGED_SOCKET_WARNING=0
+    socket_path=$PREFIX/sockets
+    for localfile in "$socket_path"/*; do
+      if [ -S "$localfile" ]; then
+        if (( LOGGED_SOCKET_WARNING == 0 )); then
+          printf >&2 'WARN: found dangling unix sockets in the prefix directory '
+          printf >&2 '(%q) ' "$socket_path"
+          printf >&2 'while preparing to start Kong. This may be a sign that Kong '
+          printf >&2 'was previously shut down uncleanly or is in an unknown state '
+          printf >&2 'and could require further investigation.\n'
+          LOGGED_SOCKET_WARNING=1
+        fi
+        rm -f "$localfile"
+      fi
+    done
+
+    ln -sfn /dev/stdout $PREFIX/logs/access.log
+    ln -sfn /dev/stdout $PREFIX/logs/admin_access.log
+    ln -sfn /dev/stderr $PREFIX/logs/error.log
 
     exec /usr/local/openresty/nginx/sbin/nginx \
       -p "$PREFIX" \

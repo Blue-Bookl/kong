@@ -9,7 +9,7 @@ local error = error
 local tostring = tostring
 
 
-local EMPTY = {}
+local EMPTY = require("kong.tools.table").EMPTY
 local HTTP_TOO_MANY_REQUESTS = 429
 local RATELIMIT_REMAINING = "X-RateLimit-Remaining"
 

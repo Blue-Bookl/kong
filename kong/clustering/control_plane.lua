@@ -3,14 +3,13 @@ local _MT = { __index = _M, }
 
 
 local semaphore = require("ngx.semaphore")
-local cjson = require("cjson.safe")
 local declarative = require("kong.db.declarative")
-local utils = require("kong.tools.utils")
 local clustering_utils = require("kong.clustering.utils")
 local compat = require("kong.clustering.compat")
 local constants = require("kong.constants")
 local events = require("kong.clustering.events")
 local calculate_config_hash = require("kong.clustering.config_helper").calculate_config_hash
+local EMPTY = require("kong.tools.table").EMPTY
 
 
 local string = string
@@ -21,27 +20,29 @@ local pairs = pairs
 local ngx = ngx
 local ngx_log = ngx.log
 local timer_at = ngx.timer.at
-local cjson_decode = cjson.decode
-local cjson_encode = cjson.encode
+local json_decode = clustering_utils.json_decode
+local json_encode = clustering_utils.json_encode
 local kong = kong
 local ngx_exit = ngx.exit
 local exiting = ngx.worker.exiting
 local worker_id = ngx.worker.id
 local ngx_time = ngx.time
 local ngx_now = ngx.now
-local ngx_update_time = ngx.update_time
 local ngx_var = ngx.var
 local table_insert = table.insert
 local table_remove = table.remove
 local sub = string.sub
 local isempty = require("table.isempty")
 local sleep = ngx.sleep
+local now_updated = require("kong.tools.time").get_updated_now
 
 
 local plugins_list_to_map = compat.plugins_list_to_map
 local update_compatible_payload = compat.update_compatible_payload
-local deflate_gzip = utils.deflate_gzip
-local yield = utils.yield
+local check_mixed_route_entities = compat.check_mixed_route_entities
+local deflate_gzip = require("kong.tools.gzip").deflate_gzip
+local yield = require("kong.tools.yield").yield
+local connect_dp = clustering_utils.connect_dp
 
 
 local kong_dict = ngx.shared.kong
@@ -52,13 +53,15 @@ local ngx_ERR = ngx.ERR
 local ngx_OK = ngx.OK
 local ngx_ERROR = ngx.ERROR
 local ngx_CLOSE = ngx.HTTP_CLOSE
-local PING_INTERVAL = constants.CLUSTERING_PING_INTERVAL
-local PING_WAIT = PING_INTERVAL * 1.5
+local PING_WAIT = constants.CLUSTERING_PING_INTERVAL * 1.5
 local CLUSTERING_SYNC_STATUS = constants.CLUSTERING_SYNC_STATUS
 local DECLARATIVE_EMPTY_CONFIG_HASH = constants.DECLARATIVE_EMPTY_CONFIG_HASH
 local PONG_TYPE = "PONG"
 local RECONFIGURE_TYPE = "RECONFIGURE"
 local _log_prefix = "[clustering] "
+
+
+local no_connected_clients_logged
 
 
 local function handle_export_deflated_reconfigure_payload(self)
@@ -74,13 +77,33 @@ local function is_timeout(err)
 end
 
 
-function _M.new(conf, cert_digest)
+local function is_closed(err)
+  return err and sub(err, -6) == "closed"
+end
+
+
+local function extract_dp_cert(cert)
+  local expiry_timestamp = cert:get_not_after()
+  -- values in cert_details must be strings
+  local cert_details = {
+    expiry_timestamp = expiry_timestamp,
+  }
+
+  return cert_details
+end
+
+
+function _M.new(clustering)
+  assert(type(clustering) == "table",
+         "kong.clustering is not instantiated")
+
+  assert(type(clustering.conf) == "table",
+         "kong.clustering did not provide configuration")
+
   local self = {
     clients = setmetatable({}, { __mode = "k", }),
     plugins_map = {},
-
-    conf = conf,
-    cert_digest = cert_digest,
+    conf = clustering.conf,
   }
 
   return setmetatable(self, _MT)
@@ -102,9 +125,9 @@ function _M:export_deflated_reconfigure_payload()
   end
 
   -- store serialized plugins map for troubleshooting purposes
-  local shm_key_name = "clustering:cp_plugins_configured:worker_" .. worker_id()
-  kong_dict:set(shm_key_name, cjson_encode(self.plugins_configured))
-  ngx_log(ngx_DEBUG, "plugin configuration map key: " .. shm_key_name .. " configuration: ", kong_dict:get(shm_key_name))
+  local shm_key_name = "clustering:cp_plugins_configured:worker_" .. (worker_id() or -1)
+  kong_dict:set(shm_key_name, json_encode(self.plugins_configured))
+  kong.log.trace(_log_prefix, "plugin configuration map key: ", shm_key_name, " configuration: ", kong_dict:get(shm_key_name))
 
   local config_hash, hashes = calculate_config_hash(config_table)
 
@@ -118,7 +141,7 @@ function _M:export_deflated_reconfigure_payload()
 
   self.reconfigure_payload = payload
 
-  payload, err = cjson_encode(payload)
+  payload, err = json_encode(payload)
   if not payload then
     return nil, err
   end
@@ -156,9 +179,8 @@ function _M:push_config()
     n = n + 1
   end
 
-  ngx_update_time()
-  local duration = ngx_now() - start
-  ngx_log(ngx_DEBUG, _log_prefix, "config pushed to ", n, " data-plane nodes in " .. duration .. " seconds")
+  local duration = now_updated() - start
+  ngx_log(ngx_DEBUG, _log_prefix, "config pushed to ", n, " data-plane nodes in ", duration, " seconds")
 end
 
 
@@ -166,15 +188,13 @@ _M.check_version_compatibility = compat.check_version_compatibility
 _M.check_configuration_compatibility = compat.check_configuration_compatibility
 
 
-function _M:handle_cp_websocket()
+function _M:handle_cp_websocket(cert)
   local dp_id = ngx_var.arg_node_id
   local dp_hostname = ngx_var.arg_node_hostname
   local dp_ip = ngx_var.remote_addr
   local dp_version = ngx_var.arg_node_version
 
-  local wb, log_suffix, ec = clustering_utils.connect_dp(
-                                self.conf, self.cert_digest,
-                                dp_id, dp_hostname, dp_ip, dp_version)
+  local wb, log_suffix, ec = connect_dp(dp_id, dp_hostname, dp_ip, dp_version)
   if not wb then
     return ngx_exit(ec)
   end
@@ -191,21 +211,18 @@ function _M:handle_cp_websocket()
       err = "failed to receive websocket basic info data"
 
     else
-      data, err = cjson_decode(data)
+      data, err = json_decode(data)
       if type(data) ~= "table" then
-        if err then
-          err = "failed to decode websocket basic info data: " .. err
-        else
-          err = "failed to decode websocket basic info data"
-        end
+          err = "failed to decode websocket basic info data" ..
+                (err and ": " .. err or "")
 
       else
         if data.type ~= "basic_info" then
-          err =  "invalid basic info data type: " .. (data.type  or "unknown")
+          err = "invalid basic info data type: " .. (data.type or "unknown")
 
         else
           if type(data.plugins) ~= "table" then
-            err =  "missing plugins in basic info data"
+            err = "missing plugins in basic info data"
           end
         end
       end
@@ -218,21 +235,34 @@ function _M:handle_cp_websocket()
     return ngx_exit(ngx_CLOSE)
   end
 
+  local dp_cert_details = extract_dp_cert(cert)
   local dp_plugins_map = plugins_list_to_map(data.plugins)
   local config_hash = DECLARATIVE_EMPTY_CONFIG_HASH -- initial hash
   local last_seen = ngx_time()
   local sync_status = CLUSTERING_SYNC_STATUS.UNKNOWN
   local purge_delay = self.conf.cluster_data_plane_purge_delay
   local update_sync_status = function()
+    local rpc_peers
+
+    if self.conf.cluster_rpc then
+      rpc_peers = kong.rpc:get_peers()
+    end
+
     local ok
-    ok, err = kong.db.clustering_data_planes:upsert({ id = dp_id, }, {
+    ok, err = kong.db.clustering_data_planes:upsert({ id = dp_id }, {
       last_seen = last_seen,
-      config_hash = config_hash ~= "" and config_hash or nil,
+      config_hash = config_hash ~= ""
+                and config_hash
+                 or DECLARATIVE_EMPTY_CONFIG_HASH,
       hostname = dp_hostname,
       ip = dp_ip,
       version = dp_version,
       sync_status = sync_status, -- TODO: import may have been failed though
-    }, { ttl = purge_delay })
+      labels = data.labels,
+      cert_details = dp_cert_details,
+      -- only update rpc_capabilities if dp_id is connected
+      rpc_capabilities = rpc_peers and rpc_peers[dp_id] or EMPTY,
+    }, { ttl = purge_delay, no_broadcast_crud_event = true, })
     if not ok then
       ngx_log(ngx_ERR, _log_prefix, "unable to update clustering data plane status: ", err, log_suffix)
     end
@@ -276,10 +306,11 @@ function _M:handle_cp_websocket()
   self.clients[wb] = queue
 
   if self.deflated_reconfigure_payload then
-    local _
     -- initial configuration compatibility for sync status variable
-    _, _, sync_status = self:check_configuration_compatibility(
-                              { dp_plugins_map = dp_plugins_map, })
+    _, _, sync_status = self:check_configuration_compatibility({
+      dp_plugins_map = dp_plugins_map,
+      filters = data.filters,
+    })
 
     table_insert(queue, RECONFIGURE_TYPE)
     queue.post()
@@ -321,97 +352,133 @@ function _M:handle_cp_websocket()
                       PING_WAIT .. " seconds"
         end
 
-      else
-        if typ == "close" then
-          ngx_log(ngx_DEBUG, _log_prefix, "received close frame from data plane", log_suffix)
-          return
-        end
-
-        if not data then
-          return nil, "did not receive ping frame from data plane"
-        end
-
-        -- dps only send pings
-        if typ ~= "ping" then
-          return nil, "invalid websocket frame received from data plane: " .. typ
-        end
-
-        ngx_log(ngx_DEBUG, _log_prefix, "received ping frame from data plane", log_suffix)
-
-        config_hash = data
-        last_seen = ngx_time()
-        update_sync_status()
-
-        -- queue PONG to avoid races
-        table_insert(queue, PONG_TYPE)
-        queue.post()
+        -- timeout
+        goto continue
       end
+
+      if typ == "close" then
+        ngx_log(ngx_DEBUG, _log_prefix, "received close frame from data plane", log_suffix)
+        return
+      end
+
+      if not data then
+        return nil, "did not receive ping frame from data plane"
+
+      elseif #data ~= 32 then
+        return nil, "received a ping frame from the data plane with an invalid"
+                 .. " hash: '" .. tostring(data) .. "'"
+      end
+
+      -- dps only send pings
+      if typ ~= "ping" then
+        return nil, "invalid websocket frame received from data plane: " .. typ
+      end
+
+      kong.log.trace(_log_prefix, "received ping frame from data plane", log_suffix)
+
+      config_hash = data
+      last_seen = ngx_time()
+      update_sync_status()
+
+      -- queue PONG to avoid races
+      table_insert(queue, PONG_TYPE)
+      queue.post()
+
+      ::continue::
     end
   end)
 
   local write_thread = ngx.thread.spawn(function()
     while not exiting() do
       local ok, err = queue.wait(5)
+
       if exiting() then
         return
       end
-      if ok then
-        local payload = table_remove(queue, 1)
-        if not payload then
-          return nil, "config queue can not be empty after semaphore returns"
+
+      if not ok then
+        if err ~= "timeout" then
+          return nil, "semaphore wait error: " .. err
         end
 
-        if payload == PONG_TYPE then
-          local _, err = wb:send_pong()
-          if err then
-            if not is_timeout(err) then
-              return nil, "failed to send pong frame to data plane: " .. err
-            end
-
-            ngx_log(ngx_NOTICE, _log_prefix, "failed to send pong frame to data plane: ", err, log_suffix)
-
-          else
-            ngx_log(ngx_DEBUG, _log_prefix, "sent pong frame to data plane", log_suffix)
-          end
-
-        else -- is reconfigure
-          local previous_sync_status = sync_status
-          ok, err, sync_status = self:check_configuration_compatibility(
-                                    { dp_plugins_map = dp_plugins_map, })
-          if ok then
-            local has_update, deflated_payload, err = update_compatible_payload(self.reconfigure_payload, dp_version, log_suffix)
-            if not has_update then -- no modification, use the cached payload
-              deflated_payload = self.deflated_reconfigure_payload
-            elseif err then
-              ngx_log(ngx_WARN, "unable to update compatible payload: ", err, ", the unmodified config ",
-                                "is returned", log_suffix)
-              deflated_payload = self.deflated_reconfigure_payload
-            end
-
-            -- config update
-            local _, err = wb:send_binary(deflated_payload)
-            if err then
-              if not is_timeout(err) then
-                return nil, "unable to send updated configuration to data plane: " .. err
-              end
-
-              ngx_log(ngx_NOTICE, _log_prefix, "unable to send updated configuration to data plane: ", err, log_suffix)
-
-            else
-              ngx_log(ngx_DEBUG, _log_prefix, "sent config update to data plane", log_suffix)
-            end
-
-          else
-            ngx_log(ngx_WARN, _log_prefix, "unable to send updated configuration to data plane: ", err, log_suffix)
-            if sync_status ~= previous_sync_status then
-              update_sync_status()
-            end
-          end
-        end
-
-      elseif err ~= "timeout" then
-        return nil, "semaphore wait error: " .. err
+        -- timeout
+        goto continue
       end
+
+      local payload = table_remove(queue, 1)
+      if not payload then
+        return nil, "config queue can not be empty after semaphore returns"
+      end
+
+      if payload == PONG_TYPE then
+        local _, err = wb:send_pong()
+        if err then
+          if not is_timeout(err) then
+            return nil, "failed to send pong frame to data plane: " .. err
+          end
+
+          ngx_log(ngx_NOTICE, _log_prefix, "failed to send pong frame to data plane: ", err, log_suffix)
+
+        else
+          kong.log.trace(_log_prefix, "sent pong frame to data plane", log_suffix)
+        end
+
+        -- pong ok
+        goto continue
+      end
+
+      -- is reconfigure
+      assert(payload == RECONFIGURE_TYPE)
+
+      local previous_sync_status = sync_status
+      ok, err, sync_status = self:check_configuration_compatibility({
+        dp_plugins_map = dp_plugins_map,
+        filters = data.filters,
+      })
+
+      if not ok then
+        ngx_log(ngx_WARN, _log_prefix, "unable to send updated configuration to data plane: ", err, log_suffix)
+        if sync_status ~= previous_sync_status then
+          update_sync_status()
+        end
+
+        goto continue
+      end
+
+      ok, err = check_mixed_route_entities(self.reconfigure_payload, dp_version,
+                                           kong and kong.configuration and
+                                           kong.configuration.router_flavor)
+      if not ok then
+        ngx_log(ngx_WARN, _log_prefix, "unable to send updated configuration to data plane: ", err, log_suffix)
+
+        goto continue
+      end
+
+      local _, deflated_payload, err = update_compatible_payload(self.reconfigure_payload, dp_version, log_suffix)
+
+      if not deflated_payload then -- no modification or err, use the cached payload
+        deflated_payload = self.deflated_reconfigure_payload
+      end
+
+      if err then
+        ngx_log(ngx_WARN, "unable to update compatible payload: ", err, ", the unmodified config ",
+                          "is returned", log_suffix)
+      end
+
+      -- config update
+      local _, err = wb:send_binary(deflated_payload)
+      if err then
+        if not is_timeout(err) then
+          return nil, "unable to send updated configuration to data plane: " .. err
+        end
+
+        ngx_log(ngx_NOTICE, _log_prefix, "unable to send updated configuration to data plane: ", err, log_suffix)
+
+      else
+        ngx_log(ngx_DEBUG, _log_prefix, "sent config update to data plane", log_suffix)
+      end
+
+      ::continue::
     end
   end)
 
@@ -434,7 +501,12 @@ function _M:handle_cp_websocket()
   end
 
   if perr then
-    ngx_log(ngx_ERR, _log_prefix, perr, log_suffix)
+    if is_closed(perr) then
+      ngx_log(ngx_DEBUG, _log_prefix, "data plane closed the connection", log_suffix)
+    else
+      ngx_log(ngx_ERR, _log_prefix, perr, log_suffix)
+    end
+
     return ngx_exit(ngx_ERROR)
   end
 
@@ -458,48 +530,62 @@ local function push_config_loop(premature, self, push_config_semaphore, delay)
       return
     end
 
-    if ok then
-      if isempty(self.clients) then
-        ngx_log(ngx_DEBUG, _log_prefix, "skipping config push (no connected clients)")
-        sleep(1)
-        -- re-queue the task. wait until we have clients connected
-        if push_config_semaphore:count() <= 0 then
-          push_config_semaphore:post()
-        end
-
-      else
-        ok, err = pcall(self.push_config, self)
-        if ok then
-          local sleep_left = delay
-          while sleep_left > 0 do
-            if sleep_left <= 1 then
-              ngx.sleep(sleep_left)
-              break
-            end
-
-            ngx.sleep(1)
-
-            if exiting() then
-              return
-            end
-
-            sleep_left = sleep_left - 1
-          end
-
-        else
-          ngx_log(ngx_ERR, _log_prefix, "export and pushing config failed: ", err)
-        end
+    if not ok then
+      if err ~= "timeout" then
+        ngx_log(ngx_ERR, _log_prefix, "semaphore wait error: ", err)
       end
 
-    elseif err ~= "timeout" then
-      ngx_log(ngx_ERR, _log_prefix, "semaphore wait error: ", err)
+      goto continue
     end
+
+    if isempty(self.clients) then
+      if not no_connected_clients_logged then
+        ngx_log(ngx_DEBUG, _log_prefix, "skipping config push (no connected clients)")
+        no_connected_clients_logged = true
+      end
+      sleep(1)
+      -- re-queue the task. wait until we have clients connected
+      if push_config_semaphore:count() <= 0 then
+        push_config_semaphore:post()
+      end
+
+      goto continue
+    end
+
+    no_connected_clients_logged = nil
+
+    ok, err = pcall(self.push_config, self)
+    if not ok then
+      ngx_log(ngx_ERR, _log_prefix, "export and pushing config failed: ", err)
+      goto continue
+    end
+
+    -- push_config ok, waiting for a while
+
+    local sleep_left = delay
+    while sleep_left > 0 do
+      if sleep_left <= 1 then
+        sleep(sleep_left)
+        break
+      end
+
+      sleep(1)
+
+      if exiting() then
+        return
+      end
+
+      sleep_left = sleep_left - 1
+    end
+
+    ::continue::
   end
 end
 
 
-function _M:init_worker(plugins_list)
+function _M:init_worker(basic_info)
   -- ROLE = "control_plane"
+  local plugins_list = basic_info.plugins
   self.plugins_list = plugins_list
   self.plugins_map = plugins_list_to_map(plugins_list)
 
@@ -512,6 +598,8 @@ function _M:init_worker(plugins_list)
     local plugin = plugins_list[i]
     self.plugin_versions[plugin.name] = plugin.version
   end
+
+  self.filters = basic_info.filters
 
   local push_config_semaphore = semaphore.new()
 

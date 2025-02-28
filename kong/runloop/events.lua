@@ -1,8 +1,8 @@
-local utils        = require "kong.tools.utils"
 local constants    = require "kong.constants"
 local certificate  = require "kong.runloop.certificate"
 local balancer     = require "kong.runloop.balancer"
 local workspaces   = require "kong.workspaces"
+local wasm         = require "kong.runloop.wasm"
 
 
 local kong         = kong
@@ -10,7 +10,7 @@ local unpack       = unpack
 local ipairs       = ipairs
 local tonumber     = tonumber
 local fmt          = string.format
-local utils_split  = utils.split
+local split        = require("kong.tools.string").split
 
 
 local ngx   = ngx
@@ -113,7 +113,7 @@ end
 
 -- cluster event: "balancer:targets"
 local function cluster_balancer_targets_handler(data)
-  local operation, key = unpack(utils_split(data, ":"))
+  local operation, key = unpack(split(data, ":"))
 
   local entity = "all"
   if key ~= "all" then
@@ -151,7 +151,7 @@ end
 
 
 local function cluster_balancer_upstreams_handler(data)
-  local operation, ws_id, id, name = unpack(utils_split(data, ":"))
+  local operation, ws_id, id, name = unpack(split(data, ":"))
   local entity = {
     id = id,
     name = name,
@@ -258,20 +258,29 @@ local function crud_plugins_handler(data)
 end
 
 
-local function crud_snis_handler(data)
-  log(DEBUG, "[events] SNI updated, invalidating cached certificates")
-
-  local sni = data.old_entity or data.entity
-  local sni_name = sni.name
+local function invalidate_snis(sni_name)
   local sni_wild_pref, sni_wild_suf = certificate.produce_wild_snis(sni_name)
   core_cache:invalidate("snis:" .. sni_name)
 
-  if sni_wild_pref then
+  if sni_wild_pref and sni_wild_pref ~= sni_name then
     core_cache:invalidate("snis:" .. sni_wild_pref)
   end
 
-  if sni_wild_suf then
+  if sni_wild_suf and sni_wild_suf ~= sni_name then
     core_cache:invalidate("snis:" .. sni_wild_suf)
+  end
+end
+
+
+local function crud_snis_handler(data)
+  log(DEBUG, "[events] SNI updated, invalidating cached certificates")
+
+  local new_name = data.entity.name
+  local old_name = data.old_entity and data.old_entity.name
+
+  invalidate_snis(new_name)
+  if old_name and old_name ~= new_name then
+    invalidate_snis(old_name)
   end
 end
 
@@ -298,6 +307,87 @@ local function crud_consumers_handler(data)
 end
 
 
+local function crud_wasm_handler(data, schema_name)
+  if not wasm.enabled() then
+    return
+  end
+
+  local invalidate = false
+
+  -- always invalidate for filter_chain entity changes
+  if schema_name == "filter_chains" then
+    invalidate = true
+
+  -- invalidate on service/route deletion to ensure we don't have any orphaned
+  -- filter chain data cached
+  elseif schema_name == "services" or schema_name == "routes" then
+    invalidate = data.operation == "delete"
+
+  -- invalidate for changes to wasm filter plugin entities
+  elseif schema_name == "plugins" then
+    local new_name = data.entity.name
+    local old_name = data.old_entity and data.old_entity.name
+    invalidate = (new_name and wasm.filters_by_name[new_name]) or
+                 (old_name and wasm.filters_by_name[old_name])
+  end
+
+  if invalidate then
+    log(DEBUG, "[events] wasm filter chains updated, invalidating cache")
+    core_cache:invalidate("filter_chains:version")
+  end
+end
+
+
+local function crud_ca_certificates_handler(data)
+  if data.operation ~= "update" then
+    return
+  end
+
+  log(DEBUG, "[events] CA certificate updated, invalidating ca certificate store caches")
+
+  local ca_id = data.entity.id
+
+  local done_keys = {}
+  for _, entity in ipairs(certificate.get_ca_certificate_reference_entities()) do
+    local elements, err = kong.db[entity]:select_by_ca_certificate(ca_id)
+    if err then
+      log(ERR, "[events] failed to select ", entity, " by ca certificate ", ca_id, ": ", err)
+      return
+    end
+
+    if elements then
+      for _, e in ipairs(elements) do
+        local key = certificate.ca_ids_cache_key(e.ca_certificates)
+
+        if not done_keys[key] then
+          done_keys[key] = true
+          kong.core_cache:invalidate(key)
+        end
+      end
+    end
+  end
+
+  local plugin_done_keys = {}
+  local plugins, err = kong.db.plugins:select_by_ca_certificate(ca_id, nil,
+    certificate.get_ca_certificate_reference_plugins())
+  if err then
+    log(ERR, "[events] failed to select plugins by ca certificate ", ca_id, ": ", err)
+    return
+  end
+
+  if plugins then
+    for _, e in ipairs(plugins) do
+      local key = certificate.ca_ids_cache_key(e.config.ca_certificates)
+
+      if not plugin_done_keys[key] then
+        plugin_done_keys[key] = true
+        kong.cache:invalidate(key)
+      end
+    end
+  end
+end
+
+
 local LOCAL_HANDLERS = {
   { "dao:crud", nil         , dao_crud_handler },
 
@@ -313,6 +403,14 @@ local LOCAL_HANDLERS = {
   -- As we support conifg.anonymous to be configured as Consumer.username,
   -- so add an event handler to invalidate the extra cache in case of data inconsistency
   { "crud"    , "consumers" , crud_consumers_handler },
+
+  { "crud"    , "filter_chains"  , crud_wasm_handler },
+  { "crud"    , "services"       , crud_wasm_handler },
+  { "crud"    , "routes"         , crud_wasm_handler },
+  { "crud"    , "plugins"        , crud_wasm_handler },
+
+  -- ca certificate store caches invalidations
+  { "crud"    , "ca_certificates" , crud_ca_certificates_handler },
 }
 
 
@@ -404,7 +502,11 @@ local function register_events(reconfigure_handler)
   if db.strategy == "off" then
     -- declarative config updates
     register_for_dbless(reconfigure_handler)
-    return
+
+    -- dbless (not dataplane) has no other events
+    if not kong.sync then
+      return
+    end
   end
 
   register_for_db()
@@ -416,8 +518,110 @@ local function _register_balancer_events(f)
 end
 
 
+local declarative_reconfigure_notify
+local stream_reconfigure_listener
+do
+  local buffer = require "string.buffer"
+
+  -- this module may be loaded before `kong.configuration` is initialized
+  local socket_path = kong and kong.configuration
+                      and kong.configuration.socket_path
+
+  if not socket_path then
+    -- `kong.configuration.socket_path` is already normalized to an absolute
+    -- path, but `ngx.config.prefix()` is not
+    socket_path = require("pl.path").abspath(ngx.config.prefix() .. "/"
+                                             .. constants.SOCKET_DIRECTORY)
+  end
+
+  local STREAM_CONFIG_SOCK = "unix:" .. socket_path .. "/" .. constants.SOCKETS.STREAM_CONFIG
+  local IS_HTTP_SUBSYSTEM  = ngx.config.subsystem == "http"
+
+  local function broadcast_reconfigure_event(data)
+    return kong.worker_events.post("declarative", "reconfigure", data)
+  end
+
+  declarative_reconfigure_notify = function(reconfigure_data)
+
+    -- call reconfigure_handler in each worker's http subsystem
+    local ok, err = broadcast_reconfigure_event(reconfigure_data)
+    if ok ~= "done" then
+      return nil, "failed to broadcast reconfigure event: " .. (err or ok)
+    end
+
+    -- only http should notify stream
+    if not IS_HTTP_SUBSYSTEM or
+       #kong.configuration.stream_listeners == 0
+    then
+      return true
+    end
+
+    -- update stream if necessary
+
+    local str, err = buffer.encode(reconfigure_data)
+    if not str then
+      return nil, err
+    end
+
+    local sock = ngx.socket.tcp()
+    ok, err = sock:connect(STREAM_CONFIG_SOCK)
+    if not ok then
+      return nil, err
+    end
+
+    -- send to stream_reconfigure_listener()
+
+    local bytes
+    bytes, err = sock:send(str)
+    sock:close()
+
+    if not bytes then
+      return nil, err
+    end
+
+    assert(bytes == #str,
+           "incomplete reconfigure data sent to the stream subsystem")
+
+    return true
+  end
+
+  stream_reconfigure_listener = function()
+    local sock, err = ngx.req.socket()
+    if not sock then
+      ngx.log(ngx.CRIT, "unable to obtain request socket: ", err)
+      return
+    end
+
+    local data, err = sock:receive("*a")
+    if not data then
+      ngx.log(ngx.CRIT, "unable to receive reconfigure data: ", err)
+      return
+    end
+
+    local reconfigure_data, err = buffer.decode(data)
+    if not reconfigure_data then
+      ngx.log(ngx.ERR, "failed to decode reconfigure data: ", err)
+      return
+    end
+
+    -- call reconfigure_handler in each worker's stream subsystem
+    local ok, err = broadcast_reconfigure_event(reconfigure_data)
+    if ok ~= "done" then
+      ngx.log(ngx.ERR, "failed to rebroadcast reconfigure event in stream: ", err or ok)
+    end
+  end
+end
+
+
 return {
+  -- runloop/handler.lua
   register_events = register_events,
+
+  -- db/declarative/import.lua
+  declarative_reconfigure_notify = declarative_reconfigure_notify,
+
+  -- init.lua
+  stream_reconfigure_listener = stream_reconfigure_listener,
 
   -- exposed only for tests
   _register_balancer_events = _register_balancer_events,
